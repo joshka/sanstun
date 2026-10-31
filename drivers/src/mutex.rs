@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
 use tokio::task::JoinSet;
 
-use crate::peer::{AbortOnDrop, BATCH, Output, Peer, Routes, now, sleep_until};
+use crate::peer::{AbortOnDrop, BATCH, Output, Peer, Routes, now, recv_decrypted, sleep_until};
 use crate::{Node, NodeIo};
 
 struct Shared {
@@ -19,7 +19,11 @@ struct Shared {
 }
 
 pub(crate) async fn run(node: Node, io: NodeIo) {
-    let Node { interface, peers } = node;
+    let Node {
+        interface,
+        peers,
+        offload,
+    } = node;
     let out = Output::new(&io);
     let NodeIo {
         mut udp_rx,
@@ -41,13 +45,13 @@ pub(crate) async fn run(node: Node, io: NodeIo) {
     // Dropping the set when the node stops aborts the other tasks.
     let mut tasks = JoinSet::new();
     for shared in peers.iter() {
-        tasks.spawn(timer(shared.clone(), out.clone()));
+        tasks.spawn(crate::polls::timed(timer(shared.clone(), out.clone())));
     }
 
     // Stops the node once the TUN device closes.
-    let mut tun = tokio::spawn({
+    let mut tun = tokio::spawn(crate::polls::timed({
         let peers = peers.clone();
-        let out = out.clone();
+        let (out, _) = out.offloading(offload);
         async move {
             let mut packets = Vec::with_capacity(BATCH);
             while tun_rx.recv_many(&mut packets, BATCH).await > 0 {
@@ -57,17 +61,28 @@ pub(crate) async fn run(node: Node, io: NodeIo) {
                     shared.peer.lock().unwrap().send_ip(packet, now, &out);
                     shared.deadline_changed.notify_one();
                 }
+                out.flush_offload();
             }
         }
-    });
+    }));
     let _tun = AbortOnDrop(tun.abort_handle());
 
+    let (out, mut decrypted) = out.offloading(offload);
     let mut datagrams = Vec::with_capacity(BATCH);
+    let mut commits = Vec::with_capacity(BATCH);
     loop {
         tokio::select! {
             biased;
 
             _ = &mut tun => return,
+            _ = recv_decrypted(&mut decrypted, &mut commits) => {
+                let now = now();
+                for (id, decrypted) in commits.drain(..) {
+                    let shared = &peers[id];
+                    shared.peer.lock().unwrap().commit(decrypted, now, &out);
+                    shared.deadline_changed.notify_one();
+                }
+            }
             received = udp_rx.recv_many(&mut datagrams, BATCH) => {
                 if received == 0 {
                     return;
@@ -82,12 +97,13 @@ pub(crate) async fn run(node: Node, io: NodeIo) {
                             .peer
                             .lock()
                             .unwrap()
-                            .receive(message, &datagram, now, &out);
+                            .receive(message, datagram, now, &out);
                         shared.deadline_changed.notify_one();
                     }
                 }
             }
         }
+        out.flush_offload();
     }
 }
 

@@ -10,29 +10,56 @@ use crate::session::{Decrypted, Plaintext, Role};
 use crate::timers::REJECT_AFTER_TIME;
 
 impl AsyncTunnel {
+    /// Decrypts a data message, or hands it to [`Output::offload_decrypt`] if the output
+    /// offloads, in which case [`AsyncTunnel::commit`] finishes it.
     pub(super) fn decapsulate(
         &mut self,
         data: TransportData,
-        datagram: &[u8],
+        datagram: Vec<u8>,
+        now: Instant,
+        out: &impl Output,
+    ) -> Result<(), Error> {
+        let pending = self.ensure_not_expired().and_then(|()| {
+            let remote_idx = Index::from_peer(data.receiver_idx);
+            self.sessions
+                .in_slot_of(remote_idx)
+                .filter(|session| !session.expired_at(now))
+                .ok_or(Error::NoCurrentSession)?
+                .prepare_receive_packet_data(data)
+        });
+        let pending = match pending {
+            Ok(pending) => pending,
+            Err(e) => {
+                out.recycle(datagram);
+                return Err(e);
+            }
+        };
+        if out.offloads() {
+            self.decrypts.push((pending, datagram));
+            return Ok(());
+        }
+
+        let decrypted = pending.decrypt(&datagram, out.buffer(datagram.len()));
+        out.recycle(datagram);
+        self.commit(decrypted, now, out)
+    }
+
+    /// Accepts a decrypted data message.
+    pub(super) fn commit(
+        &mut self,
+        decrypted: Decrypted<Vec<u8>>,
         now: Instant,
         out: &impl Output,
     ) -> Result<(), Error> {
         self.ensure_not_expired()?;
 
-        let remote_idx = Index::from_peer(data.receiver_idx);
+        let remote_idx = decrypted.receiving_index;
         let Decrypted {
             session: session_id,
             counter,
             plaintext,
             ..
-        } = self
-            .sessions
-            .in_slot_of(remote_idx)
-            .filter(|session| !session.expired_at(now))
-            .ok_or(Error::NoCurrentSession)?
-            .prepare_receive_packet_data(data)?
-            .decrypt(datagram, vec![0; datagram.len()]);
-
+        } = decrypted;
         let session = self
             .sessions
             .get_mut(remote_idx)

@@ -23,6 +23,7 @@ pub(crate) async fn run(node: Node, io: NodeIo) {
     let Node {
         mut interface,
         peers,
+        offload,
     } = node;
     let out = Output::new(&io);
     let NodeIo {
@@ -42,6 +43,7 @@ pub(crate) async fn run(node: Node, io: NodeIo) {
                 id,
                 addr,
                 out: out.clone(),
+                offload,
             };
             tunnels.push(tunnel.into_async().run(rx, out));
             tx

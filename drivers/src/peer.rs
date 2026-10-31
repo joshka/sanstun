@@ -4,15 +4,18 @@
 //! in response is defined here, so drivers that call these methods in the same order produce the
 //! same traffic.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::net::SocketAddr;
+use std::sync::Mutex;
 use std::time::Instant;
 
 use sanstun::{
-    Committed, Error, Event, Interface, PublicKey, Received, ReceivedMessage, Tunnel, TunnelId,
+    Committed, Decrypted, Error, Event, Interface, PendingDecapsulate, PendingEncapsulate,
+    PublicKey, Received, ReceivedMessage, Tunnel, TunnelId,
 };
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
+use crate::pool::{self, FastMap};
 use crate::{NodeEvent, NodeIo, PeerId};
 
 /// Inputs a task takes from a channel at once.
@@ -61,11 +64,49 @@ impl Drop for AbortOnDrop {
 }
 
 /// Where a peer sends its output. Cloned into every task that handles peers.
-#[derive(Clone)]
 pub(crate) struct Output {
     udp: UnboundedSender<(SocketAddr, Vec<u8>)>,
     tun: UnboundedSender<(PeerId, Vec<u8>)>,
     events: UnboundedSender<(PeerId, NodeEvent)>,
+    /// Crypto work batched for rayon, if this task offloads it.
+    offload: Option<Offload>,
+}
+
+/// A task's batches of data messages to encrypt and decrypt on rayon's pool.
+pub(crate) struct Offload {
+    // Only the owning task touches these, but `&Output` crosses `.await`s, so it must be
+    // `Sync`. The locks are never contended.
+    encrypts: Mutex<Vec<(PendingEncapsulate, Vec<u8>, SocketAddr)>>,
+    decrypts: Mutex<Vec<(PeerId, PendingDecapsulate, Vec<u8>)>>,
+    /// Returns decrypted messages to the task, which owns the tunnels that commit them.
+    decrypted: UnboundedSender<(PeerId, Decrypted<Vec<u8>>)>,
+}
+
+/// Decrypted messages for a task to commit.
+pub(crate) type DecryptedRx = UnboundedReceiver<(PeerId, Decrypted<Vec<u8>>)>;
+
+/// Receives decrypted messages, or never completes if the task does not offload.
+pub(crate) async fn recv_decrypted(
+    decrypted: &mut Option<DecryptedRx>,
+    commits: &mut Vec<(PeerId, Decrypted<Vec<u8>>)>,
+) -> usize {
+    match decrypted {
+        Some(decrypted) => decrypted.recv_many(commits, BATCH).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Clones share the channels but not the batches: a clone offloads nothing until it gets its
+/// own [`Output::offloading`].
+impl Clone for Output {
+    fn clone(&self) -> Self {
+        Output {
+            udp: self.udp.clone(),
+            tun: self.tun.clone(),
+            events: self.events.clone(),
+            offload: None,
+        }
+    }
 }
 
 impl Output {
@@ -74,6 +115,59 @@ impl Output {
             udp: io.udp_tx.clone(),
             tun: io.tun_tx.clone(),
             events: io.events.clone(),
+            offload: None,
+        }
+    }
+
+    /// Returns an output that batches crypto for rayon if `offload`, and the channel that
+    /// decrypted messages come back on.
+    pub(crate) fn offloading(&self, offload: bool) -> (Output, Option<DecryptedRx>) {
+        let mut out = self.clone();
+        if !offload {
+            return (out, None);
+        }
+
+        let (decrypted, rx) = tokio::sync::mpsc::unbounded_channel();
+        out.offload = Some(Offload {
+            encrypts: Mutex::default(),
+            decrypts: Mutex::default(),
+            decrypted,
+        });
+
+        (out, Some(rx))
+    }
+
+    /// Hands the batched crypto work to rayon. Call after each batch of inputs.
+    pub(crate) fn flush_offload(&self) {
+        let Some(offload) = &self.offload else {
+            return;
+        };
+
+        let encrypts = std::mem::take(&mut *offload.encrypts.lock().unwrap());
+        if !encrypts.is_empty() {
+            let udp = self.udp.clone();
+            rayon::spawn(move || {
+                for (pending, packet, dst) in encrypts {
+                    let mut buf = pool::take(packet.len().next_multiple_of(16) + 32);
+                    if let Ok(len) = pending.encrypt(&packet, &mut buf).map(|m| m.len()) {
+                        buf.truncate(len);
+                        let _ = udp.send((dst, buf));
+                    }
+                    pool::recycle(packet);
+                }
+            });
+        }
+
+        let decrypts = std::mem::take(&mut *offload.decrypts.lock().unwrap());
+        if !decrypts.is_empty() {
+            let decrypted = offload.decrypted.clone();
+            rayon::spawn(move || {
+                for (peer, pending, datagram) in decrypts {
+                    let result = pending.decrypt(&datagram, pool::take(datagram.len()));
+                    pool::recycle(datagram);
+                    let _ = decrypted.send((peer, result));
+                }
+            });
         }
     }
 
@@ -143,15 +237,36 @@ impl Peer {
         self.drain_events(now, out);
     }
 
-    /// Handles a message that [`Interface::receive`] routed to this peer.
+    /// Handles a message that [`Interface::receive`] routed to this peer, recycling its
+    /// datagram.
     pub(crate) fn receive(
         &mut self,
         message: ReceivedMessage,
-        datagram: &[u8],
+        datagram: Vec<u8>,
         now: Instant,
         out: &Output,
     ) {
         let result = match message {
+            ReceivedMessage::TransportData(data) => self.decrypt(data, datagram, now, out),
+            message => {
+                pool::recycle(datagram);
+                self.handle_handshake_message(message, now, out)
+            }
+        };
+        if let Err(e) = result {
+            out.error(self.id, e);
+        }
+
+        self.drain_events(now, out);
+    }
+
+    fn handle_handshake_message(
+        &mut self,
+        message: ReceivedMessage,
+        now: Instant,
+        out: &Output,
+    ) -> Result<(), Error> {
+        match message {
             ReceivedMessage::HandshakeInitiation(init) => self
                 .tunnel
                 .handle_handshake_initiation(init, now)
@@ -161,13 +276,8 @@ impl Peer {
                 .handle_handshake_response(response, now)
                 .map(|keepalive| out.datagram(self.addr, keepalive.to_vec())),
             ReceivedMessage::CookieReply(reply) => self.tunnel.handle_cookie_reply(reply, now),
-            ReceivedMessage::TransportData(data) => self.decrypt(data, datagram, now, out),
-        };
-        if let Err(e) = result {
-            out.error(self.id, e);
+            ReceivedMessage::TransportData(_) => unreachable!("data is decrypted"),
         }
-
-        self.drain_events(now, out);
     }
 
     pub(crate) fn handle_timeout(&mut self, now: Instant, out: &Output) {
@@ -175,18 +285,51 @@ impl Peer {
         self.drain_events(now, out);
     }
 
+    /// Decrypts a data message, or hands it to rayon if the output offloads, in which case
+    /// [`Peer::commit`] finishes it.
     fn decrypt(
         &mut self,
         data: sanstun::TransportData,
-        datagram: &[u8],
+        datagram: Vec<u8>,
         now: Instant,
         out: &Output,
     ) -> Result<(), Error> {
-        let decrypted = self
-            .tunnel
-            .begin_decapsulate(data, now)?
-            .decrypt(datagram, vec![0; datagram.len()]);
+        let pending = match self.tunnel.begin_decapsulate(data, now) {
+            Ok(pending) => pending,
+            Err(e) => {
+                pool::recycle(datagram);
+                return Err(e);
+            }
+        };
+        if let Some(offload) = &out.offload {
+            offload
+                .decrypts
+                .lock()
+                .unwrap()
+                .push((self.id, pending, datagram));
+            return Ok(());
+        }
 
+        let decrypted = pending.decrypt(&datagram, pool::take(datagram.len()));
+        pool::recycle(datagram);
+        self.commit_decrypted(decrypted, now, out)
+    }
+
+    /// Accepts a message that rayon decrypted.
+    pub(crate) fn commit(&mut self, decrypted: Decrypted<Vec<u8>>, now: Instant, out: &Output) {
+        if let Err(e) = self.commit_decrypted(decrypted, now, out) {
+            out.error(self.id, e);
+        }
+
+        self.drain_events(now, out);
+    }
+
+    fn commit_decrypted(
+        &mut self,
+        decrypted: Decrypted<Vec<u8>>,
+        now: Instant,
+        out: &Output,
+    ) -> Result<(), Error> {
         match self.tunnel.commit_decapsulate(decrypted, now)? {
             Committed::Data { mut buffer, len } => {
                 buffer.truncate(ip_packet_len(&buffer[..len]));
@@ -209,10 +352,22 @@ impl Peer {
             }
         };
 
-        let mut buf = vec![0; packet.len().next_multiple_of(16) + 32];
-        match pending.encrypt(&packet, &mut buf) {
-            Ok(message) => {
-                let len = message.len();
+        if let Some(offload) = &out.offload {
+            offload
+                .encrypts
+                .lock()
+                .unwrap()
+                .push((pending, packet, self.addr));
+            return Ok(());
+        }
+
+        let mut buf = pool::take(packet.len().next_multiple_of(16) + 32);
+        let encrypted = pending
+            .encrypt(&packet, &mut buf)
+            .map(|message| message.len());
+        pool::recycle(packet);
+        match encrypted {
+            Ok(len) => {
                 buf.truncate(len);
                 out.datagram(self.addr, buf);
             }
@@ -259,15 +414,15 @@ impl Peer {
 
 /// Finds the peer for each message from [`Interface::receive`].
 pub(crate) struct Routes {
-    by_tunnel: HashMap<TunnelId, PeerId>,
-    by_key: HashMap<PublicKey, PeerId>,
+    by_tunnel: FastMap<TunnelId, PeerId>,
+    by_key: FastMap<PublicKey, PeerId>,
 }
 
 impl Routes {
     pub(crate) fn new<'a>(peers: impl IntoIterator<Item = &'a Peer>) -> Self {
         let mut routes = Routes {
-            by_tunnel: HashMap::new(),
-            by_key: HashMap::new(),
+            by_tunnel: FastMap::default(),
+            by_key: FastMap::default(),
         };
         for peer in peers {
             routes.by_tunnel.insert(peer.tunnel_id(), peer.id());

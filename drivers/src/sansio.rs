@@ -20,14 +20,16 @@ pub(crate) async fn run(node: Node, mut io: NodeIo) {
     let Node {
         mut interface,
         mut peers,
+        offload,
     } = node;
-    let out = Output::new(&io);
+    let (out, mut decrypted) = Output::new(&io).offloading(offload);
     let routes = Routes::new(&peers);
     let mut timers = Timers::new(&peers);
     let mut timer = pin!(tokio::time::sleep_until(tokio::time::Instant::now()));
     let mut timer_at = None;
     let mut datagrams = Vec::with_capacity(BATCH);
     let mut packets = Vec::with_capacity(BATCH);
+    let mut commits = Vec::with_capacity(BATCH);
 
     std::future::poll_fn(|cx| {
         for _ in 0..BUDGET {
@@ -57,7 +59,7 @@ pub(crate) async fn run(node: Node, mut io: NodeIo) {
                         if let Some((id, message)) =
                             routes.receive(&mut interface, src, &datagram, now, &out)
                         {
-                            peers[id].receive(message, &datagram, now, &out);
+                            peers[id].receive(message, datagram, now, &out);
                             timers.touch(id);
                         }
                     }
@@ -78,6 +80,19 @@ pub(crate) async fn run(node: Node, mut io: NodeIo) {
                 }
                 Poll::Pending => {}
             }
+
+            if let Some(decrypted) = &mut decrypted
+                && let Poll::Ready(received) = decrypted.poll_recv_many(cx, &mut commits, BATCH)
+                && received > 0
+            {
+                let now = now();
+                for (id, decrypted) in commits.drain(..) {
+                    peers[id].commit(decrypted, now, &out);
+                    timers.touch(id);
+                }
+                progress = true;
+            }
+            out.flush_offload();
 
             // Ask touched tunnels for their deadlines once per batch rather than per packet.
             timers.update_touched(&peers);

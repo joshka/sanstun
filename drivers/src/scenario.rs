@@ -36,6 +36,7 @@ impl Star {
                 static_secret: secret(node),
                 unix: Duration::from_secs(1_700_000_000),
                 handshake_limit: 100,
+                offload: false,
                 peers,
             }
         };

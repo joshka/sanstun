@@ -51,10 +51,21 @@ impl AsyncTunnel {
             && (now >= session.established_at() + REKEY_AFTER_TIME
                 || session.rekey_after_messages_reached());
 
-        let mut buf = vec![0; packet.len().next_multiple_of(16) + DATA_OVERHEAD_SZ];
-        match pending.encrypt(&packet, &mut buf) {
-            Ok(message) => {
-                let len = message.len();
+        if out.offloads() {
+            self.encrypts.push((pending, packet));
+            self.packet_sent(now);
+            self.data_sent(now);
+            if rekey {
+                self.initiate_handshake(now, out);
+            }
+            return Ok(());
+        }
+
+        let mut buf = out.buffer(packet.len().next_multiple_of(16) + DATA_OVERHEAD_SZ);
+        let encrypted = pending.encrypt(&packet, &mut buf).map(|message| message.len());
+        out.recycle(packet);
+        match encrypted {
+            Ok(len) => {
                 buf.truncate(len);
                 out.datagram(buf);
             }

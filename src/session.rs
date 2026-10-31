@@ -208,6 +208,9 @@ pub(crate) struct Sessions {
     last_index: Index,
     /// The number of sessions inserted so far, which identifies the next one.
     inserted: u64,
+    /// The earliest expiry among `slots`, kept up to date because event loops ask for it
+    /// after every packet.
+    next_expiry: Option<Instant>,
 }
 
 impl Sessions {
@@ -218,6 +221,7 @@ impl Sessions {
             current: None,
             last_index: index,
             inserted: 0,
+            next_expiry: None,
         }
     }
 
@@ -249,6 +253,7 @@ impl Sessions {
 
         let index = session.receiving_index;
         *self.slot_mut(index) = Some(session);
+        self.update_next_expiry();
     }
 
     /// Returns the current sending session, if one exists.
@@ -298,6 +303,7 @@ impl Sessions {
             *session = None;
         }
         self.current = None;
+        self.next_expiry = None;
     }
 
     /// Discards every session past [`REJECT_AFTER_TIME`].
@@ -324,6 +330,7 @@ impl Sessions {
                 expired_current = Some(session);
             }
         }
+        self.update_next_expiry();
 
         expired_current
     }
@@ -335,7 +342,12 @@ impl Sessions {
 
     /// Returns the earliest session expiry deadline.
     pub(crate) fn next_expiry(&self) -> Option<Instant> {
-        self.slots.iter().flatten().map(Session::expires_at).min()
+        self.next_expiry
+    }
+
+    /// Sessions only expire by age, so the earliest expiry changes only when slots do.
+    fn update_next_expiry(&mut self) {
+        self.next_expiry = self.slots.iter().flatten().map(Session::expires_at).min();
     }
 
     fn get(&self, index: Index) -> Option<&Session> {

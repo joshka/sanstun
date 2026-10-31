@@ -3,6 +3,7 @@
 use std::net::SocketAddr;
 
 use sanstun::aio::{Input, Notice};
+use sanstun::{Decrypted, PendingDecapsulate, PendingEncapsulate};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 
@@ -16,6 +17,7 @@ pub(crate) async fn run(node: Node, io: NodeIo) {
     let Node {
         mut interface,
         peers,
+        offload,
     } = node;
     let out = Output::new(&io);
     let NodeIo {
@@ -36,15 +38,16 @@ pub(crate) async fn run(node: Node, io: NodeIo) {
                 id,
                 addr,
                 out: out.clone(),
+                offload,
             };
-            tunnels.spawn(tunnel.into_async().run(rx, out));
+            tunnels.spawn(crate::polls::timed(tunnel.into_async().run(rx, out)));
             tx
         })
         .collect::<Vec<_>>();
 
     // Stops the node once the TUN device closes.
     let tun_inboxes = inboxes.clone();
-    let mut tun = tokio::spawn(async move {
+    let mut tun = tokio::spawn(crate::polls::timed(async move {
         let mut packets = Vec::with_capacity(BATCH);
         while tun_rx.recv_many(&mut packets, BATCH).await > 0 {
             for (id, packet) in packets.drain(..) {
@@ -53,7 +56,7 @@ pub(crate) async fn run(node: Node, io: NodeIo) {
                 }
             }
         }
-    });
+    }));
     let _tun = AbortOnDrop(tun.abort_handle());
 
     let mut datagrams = Vec::with_capacity(BATCH);
@@ -90,6 +93,8 @@ pub(crate) struct PeerOutput {
     pub(crate) id: PeerId,
     pub(crate) addr: SocketAddr,
     pub(crate) out: Output,
+    /// Encrypts and decrypts on rayon's pool.
+    pub(crate) offload: bool,
 }
 
 impl sanstun::aio::Output for PeerOutput {
@@ -100,6 +105,46 @@ impl sanstun::aio::Output for PeerOutput {
     fn ip(&self, mut buffer: Vec<u8>, len: usize) {
         buffer.truncate(ip_packet_len(&buffer[..len]));
         self.out.ip(self.id, buffer);
+    }
+
+    fn buffer(&self, len: usize) -> Vec<u8> {
+        crate::pool::take(len)
+    }
+
+    fn recycle(&self, buffer: Vec<u8>) {
+        crate::pool::recycle(buffer);
+    }
+
+    fn offloads(&self) -> bool {
+        self.offload
+    }
+
+    fn offload_encrypt(&self, batch: Vec<(PendingEncapsulate, Vec<u8>)>) {
+        let (out, addr) = (self.out.clone(), self.addr);
+        rayon::spawn(move || {
+            for (pending, packet) in batch {
+                let mut buf = crate::pool::take(packet.len().next_multiple_of(16) + 32);
+                if let Ok(len) = pending.encrypt(&packet, &mut buf).map(|m| m.len()) {
+                    buf.truncate(len);
+                    out.datagram(addr, buf);
+                }
+                crate::pool::recycle(packet);
+            }
+        });
+    }
+
+    fn offload_decrypt(
+        &self,
+        batch: Vec<(PendingDecapsulate, Vec<u8>)>,
+        done: mpsc::UnboundedSender<Decrypted<Vec<u8>>>,
+    ) {
+        rayon::spawn(move || {
+            for (pending, datagram) in batch {
+                let decrypted = pending.decrypt(&datagram, crate::pool::take(datagram.len()));
+                crate::pool::recycle(datagram);
+                let _ = done.send(decrypted);
+            }
+        });
     }
 
     fn notice(&self, notice: Notice) {

@@ -40,6 +40,8 @@ use crate::message::ReceivedMessage;
 use crate::rng::ForwardSecureRng;
 use crate::session::Sessions;
 use crate::timers::TimerName;
+use crate::message::DATA_OVERHEAD_SZ;
+use crate::session::{Decrypted, PendingDecapsulate, PendingEncapsulate};
 use crate::{Error, Tunnel};
 use timers::Timers;
 
@@ -74,6 +76,49 @@ pub trait Output {
     /// Delivers a decrypted packet: the first `len` bytes of `buffer`, including padding.
     fn ip(&self, buffer: Vec<u8>, len: usize);
     fn notice(&self, notice: Notice);
+
+    /// Returns a buffer of `len` bytes for encrypting or decrypting into. Its contents are
+    /// overwritten.
+    fn buffer(&self, len: usize) -> Vec<u8> {
+        vec![0; len]
+    }
+
+    /// Takes back a buffer the tunnel is done with, such as a decrypted datagram.
+    fn recycle(&self, buffer: Vec<u8>) {
+        drop(buffer);
+    }
+
+    /// Returns whether to hand data messages to [`Output::offload_encrypt`] and
+    /// [`Output::offload_decrypt`] rather than encrypt and decrypt them in the tunnel's task.
+    fn offloads(&self) -> bool {
+        false
+    }
+
+    /// Encrypts a batch of data messages, for example on another thread, and sends them.
+    fn offload_encrypt(&self, batch: Vec<(PendingEncapsulate, Vec<u8>)>) {
+        for (pending, packet) in batch {
+            let mut buf = self.buffer(packet.len().next_multiple_of(16) + DATA_OVERHEAD_SZ);
+            if let Ok(len) = pending.encrypt(&packet, &mut buf).map(|m| m.len()) {
+                buf.truncate(len);
+                self.datagram(buf);
+            }
+            self.recycle(packet);
+        }
+    }
+
+    /// Decrypts a batch of data messages, for example on another thread, and sends the results
+    /// to `done` for the tunnel to commit.
+    fn offload_decrypt(
+        &self,
+        batch: Vec<(PendingDecapsulate, Vec<u8>)>,
+        done: mpsc::UnboundedSender<Decrypted<Vec<u8>>>,
+    ) {
+        for (pending, datagram) in batch {
+            let decrypted = pending.decrypt(&datagram, self.buffer(datagram.len()));
+            self.recycle(datagram);
+            let _ = done.send(decrypted);
+        }
+    }
 }
 
 /// A tunnel that runs its own timers. Create one with [`Tunnel::into_async`].
@@ -86,6 +131,9 @@ pub struct AsyncTunnel {
     /// When the current round of handshake attempts began.
     handshake_started_at: Instant,
     pending: VecDeque<Vec<u8>>,
+    /// Data messages waiting for [`Output::offload_encrypt`] and [`Output::offload_decrypt`].
+    encrypts: Vec<(PendingEncapsulate, Vec<u8>)>,
+    decrypts: Vec<(PendingDecapsulate, Vec<u8>)>,
     established: bool,
     _index_lease: Arc<()>,
 }
@@ -114,6 +162,8 @@ impl Tunnel {
             timers: Timers::default(),
             handshake_started_at: created_at,
             pending: VecDeque::new(),
+            encrypts: Vec::new(),
+            decrypts: Vec::new(),
             established: false,
             _index_lease: self._index_lease,
         };
@@ -140,6 +190,8 @@ impl AsyncTunnel {
     ) -> impl Future<Output = ()> {
         async move {
             let mut inputs = Vec::with_capacity(BATCH);
+            let (done, mut decrypted) = mpsc::unbounded_channel();
+            let mut commits = Vec::with_capacity(BATCH);
 
             loop {
                 let timers = &mut self.timers;
@@ -152,6 +204,14 @@ impl AsyncTunnel {
                     () = timers.new_handshake.expired() => self.initiate_handshake(now(), &out),
                     () = timers.persistent_keepalive.expired() => self.send_keepalive(now(), &out),
                     () = timers.zero_key_material.expired() => self.expire(&out),
+                    _ = decrypted.recv_many(&mut commits, BATCH) => {
+                        let now = now();
+                        for decrypted in commits.drain(..) {
+                            if let Err(e) = self.commit(decrypted, now, &out) {
+                                out.notice(Notice::Error(e));
+                            }
+                        }
+                    }
                     received = inbox.recv_many(&mut inputs, BATCH) => {
                         if received == 0 {
                             return;
@@ -164,6 +224,12 @@ impl AsyncTunnel {
                 }
 
                 self.flush(now(), &out);
+                if !self.encrypts.is_empty() {
+                    out.offload_encrypt(std::mem::take(&mut self.encrypts));
+                }
+                if !self.decrypts.is_empty() {
+                    out.offload_decrypt(std::mem::take(&mut self.decrypts), done.clone());
+                }
             }
         }
     }
@@ -184,7 +250,7 @@ impl AsyncTunnel {
                 self.handle_cookie_reply(reply, now)
             }
             Input::Message(ReceivedMessage::TransportData(data), datagram) => {
-                self.decapsulate(data, &datagram, now, out)
+                self.decapsulate(data, datagram, now, out)
             }
         };
         if let Err(e) = result {

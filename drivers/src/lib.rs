@@ -35,6 +35,8 @@ mod channels;
 mod mutex;
 pub mod net;
 mod peer;
+pub mod polls;
+pub mod pool;
 pub use peer::ip_packet_len;
 mod sansio;
 pub mod scenario;
@@ -81,11 +83,11 @@ impl Driver {
         let node = Node::new(config);
 
         match self {
-            Driver::SansIo => tokio::spawn(sansio::run(node, io)),
-            Driver::Channels => tokio::spawn(channels::run(node, io)),
-            Driver::Mutex => tokio::spawn(mutex::run(node, io)),
-            Driver::Async => tokio::spawn(asyncd::run(node, io)),
-            Driver::AsyncLocal => tokio::spawn(asynclocal::run(node, io)),
+            Driver::SansIo => tokio::spawn(polls::timed(sansio::run(node, io))),
+            Driver::Channels => tokio::spawn(polls::timed(channels::run(node, io))),
+            Driver::Mutex => tokio::spawn(polls::timed(mutex::run(node, io))),
+            Driver::Async => tokio::spawn(polls::timed(asyncd::run(node, io))),
+            Driver::AsyncLocal => tokio::spawn(polls::timed(asynclocal::run(node, io))),
         }
     }
 }
@@ -99,6 +101,9 @@ pub struct NodeConfig {
     pub unix: Duration,
     pub handshake_limit: u64,
     pub peers: Vec<PeerConfig>,
+    /// Encrypts and decrypts data messages on rayon's thread pool instead of in the tasks that
+    /// own the tunnels.
+    pub offload: bool,
 }
 
 impl NodeConfig {
@@ -140,6 +145,7 @@ pub enum NodeEvent {
 pub(crate) struct Node {
     interface: Interface,
     peers: Vec<peer::Peer>,
+    offload: bool,
 }
 
 impl Node {
@@ -165,6 +171,10 @@ impl Node {
             })
             .collect();
 
-        Node { interface, peers }
+        Node {
+            interface,
+            peers,
+            offload: config.offload,
+        }
     }
 }

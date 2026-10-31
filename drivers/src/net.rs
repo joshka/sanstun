@@ -1,6 +1,6 @@
 //! An in-memory network that connects nodes and optionally records their traffic.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -91,7 +91,7 @@ impl NetworkBuilder {
             records: Arc::default(),
         });
 
-        let mut inbound = HashMap::new();
+        let mut inbound = Inbound::default();
         let mut nodes = Vec::new();
         let mut outbound = Vec::new();
         for &addr in &self.nodes {
@@ -163,7 +163,7 @@ impl NetworkBuilder {
 }
 
 /// Each node's inbound datagram queue, by address.
-type Inbound = HashMap<SocketAddr, UnboundedSender<(SocketAddr, Vec<u8>)>>;
+type Inbound = crate::pool::FastMap<SocketAddr, UnboundedSender<(SocketAddr, Vec<u8>)>>;
 
 /// Carries one node's outbound datagrams to their destinations.
 async fn link(

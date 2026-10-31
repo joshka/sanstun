@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use criterion::{BenchmarkId, Criterion, Throughput};
 use sanstun_drivers::Driver;
 use sanstun_drivers::net::{Network, NodeHandle};
-use sanstun_drivers::scenario::{Running, Star, ip_packet};
+use sanstun_drivers::scenario::{Running, Star};
 use tokio::runtime::Runtime;
 
 const TUNNELS: [usize; 3] = [1, 16, 256];
@@ -61,11 +61,14 @@ impl Flavor {
 const FLAVORS: [Flavor; 2] = [Flavor::CurrentThread, Flavor::MultiThread];
 
 /// Spawns a star and completes every handshake.
-async fn established(driver: Driver, spokes: usize) -> (Star, Running) {
-    established_star(driver, Star::new(spokes, 42)).await
+async fn established(driver: Driver, spokes: usize, offload: bool) -> (Star, Running) {
+    established_star(driver, Star::new(spokes, 42), offload).await
 }
 
-async fn established_star(driver: Driver, star: Star) -> (Star, Running) {
+async fn established_star(driver: Driver, mut star: Star, offload: bool) -> (Star, Running) {
+    for node in &mut star.nodes {
+        node.offload = offload;
+    }
     let mut running = star.spawn(driver, Network::builder());
 
     for spoke in 1..=star.spokes() {
@@ -77,14 +80,22 @@ async fn established_star(driver: Driver, star: Star) -> (Star, Running) {
 }
 
 fn send(node: &NodeHandle, peer: usize, size: usize) {
-    let packet = ip_packet(&vec![0xab; size.saturating_sub(20)]);
+    // Equal for every driver: reuse buffers rather than allocating each packet.
+    let len = size.max(20);
+    let mut packet = sanstun_drivers::pool::take(len);
+    packet[..20].copy_from_slice(&[
+        0x45, 0, 0, 0, 0, 0, 0, 0, 64, 17, 0, 0, 192, 0, 2, 1, 192, 0, 2, 2,
+    ]);
+    packet[2..4].copy_from_slice(&(len as u16).to_be_bytes());
+    packet[20..].fill(0xab);
     node.tun_in.send((peer, packet)).unwrap();
 }
 
 async fn receive(node: &mut NodeHandle, count: usize) {
     let tun_out = node.tun_out.as_mut().unwrap();
     for _ in 0..count {
-        tun_out.recv().await.expect("the node is running");
+        let (_, packet) = tun_out.recv().await.expect("the node is running");
+        sanstun_drivers::pool::recycle(packet);
     }
 }
 
@@ -113,7 +124,7 @@ struct Shards {
 }
 
 impl Shards {
-    fn spawn(driver: Driver, tunnels: usize, size: usize) -> Self {
+    fn spawn(driver: Driver, tunnels: usize, size: usize, offload: bool) -> Self {
         let (done_tx, done) = std::sync::mpsc::channel();
         let commands = (0..SHARDS)
             .map(|shard| {
@@ -122,7 +133,7 @@ impl Shards {
                 std::thread::spawn(move || {
                     Flavor::CurrentThread.runtime().block_on(async move {
                         let star = Star::new(tunnels / SHARDS, 42 + shard as u8);
-                        let (star, mut running) = established_star(driver, star).await;
+                        let (star, mut running) = established_star(driver, star, offload).await;
                         done.send(()).unwrap();
                         while let Some(iters) = rx.recv().await {
                             for _ in 0..iters {
@@ -157,12 +168,38 @@ impl Shards {
     }
 }
 
+/// Runtimes to compare, and whether crypto runs on rayon's pool.
+const SETUPS: [(Flavor, bool); 3] = [
+    (Flavor::CurrentThread, false),
+    (Flavor::MultiThread, false),
+    (Flavor::CurrentThread, true),
+];
+
+fn setup_name(flavor: Flavor, offload: bool) -> String {
+    format!("{}{}", flavor.name(), if offload { "+offload" } else { "" })
+}
+
+/// Sizes rayon's pool to match the sharded threads, so offloading adds as many threads as
+/// sharding does.
+fn init_rayon() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(SHARDS)
+            .build_global()
+            .unwrap();
+    });
+}
+
 fn throughput(c: &mut Criterion) {
-    for flavor in FLAVORS {
+    init_rayon();
+    for (flavor, offload) in SETUPS {
         for tunnels in TUNNELS {
             for size in SIZES {
-                let mut group =
-                    c.benchmark_group(format!("throughput/{}/{tunnels}x{size}B", flavor.name()));
+                let mut group = c.benchmark_group(format!(
+                    "throughput/{}/{tunnels}x{size}B",
+                    setup_name(flavor, offload)
+                ));
                 group.throughput(Throughput::Elements((2 * tunnels * BATCH) as u64));
 
                 for driver in Driver::ALL {
@@ -172,7 +209,8 @@ fn throughput(c: &mut Criterion) {
                     group.bench_function(BenchmarkId::from_parameter(driver.name()), |b| {
                         let (rt, star, running) = setup.get_or_insert_with(|| {
                             let rt = flavor.runtime();
-                            let (star, running) = rt.block_on(established(driver, tunnels));
+                            let (star, running) =
+                                rt.block_on(established(driver, tunnels, offload));
                             (rt, star, running)
                         });
                         b.iter_custom(|iters| {
@@ -192,27 +230,36 @@ fn throughput(c: &mut Criterion) {
         }
     }
 
-    for tunnels in TUNNELS.into_iter().filter(|&tunnels| tunnels >= SHARDS) {
-        for size in SIZES {
-            let mut group = c.benchmark_group(format!("throughput/sharded/{tunnels}x{size}B"));
-            group.throughput(Throughput::Elements((2 * tunnels * BATCH) as u64));
+    for offload in [false, true] {
+        for tunnels in TUNNELS.into_iter().filter(|&tunnels| tunnels >= SHARDS) {
+            for size in SIZES {
+                let name = if offload {
+                    "sharded+offload"
+                } else {
+                    "sharded"
+                };
+                let mut group = c.benchmark_group(format!("throughput/{name}/{tunnels}x{size}B"));
+                group.throughput(Throughput::Elements((2 * tunnels * BATCH) as u64));
 
-            for driver in Driver::ALL {
-                let mut shards = None;
-                group.bench_function(BenchmarkId::from_parameter(driver.name()), |b| {
-                    let shards = shards.get_or_insert_with(|| Shards::spawn(driver, tunnels, size));
-                    b.iter_custom(|iters| shards.run(iters))
-                });
+                for driver in Driver::ALL {
+                    let mut shards = None;
+                    group.bench_function(BenchmarkId::from_parameter(driver.name()), |b| {
+                        let shards = shards
+                            .get_or_insert_with(|| Shards::spawn(driver, tunnels, size, offload));
+                        b.iter_custom(|iters| shards.run(iters))
+                    });
+                }
+
+                group.finish();
             }
-
-            group.finish();
         }
     }
 }
 
 fn latency(c: &mut Criterion) {
-    for flavor in FLAVORS {
-        let mut group = c.benchmark_group(format!("latency/{}", flavor.name()));
+    init_rayon();
+    for (flavor, offload) in SETUPS {
+        let mut group = c.benchmark_group(format!("latency/{}", setup_name(flavor, offload)));
 
         for driver in Driver::ALL {
             let mut setup = None;
@@ -220,7 +267,7 @@ fn latency(c: &mut Criterion) {
             group.bench_function(BenchmarkId::from_parameter(driver.name()), |b| {
                 let (rt, running) = setup.get_or_insert_with(|| {
                     let rt = flavor.runtime();
-                    let (_, running) = rt.block_on(established(driver, 1));
+                    let (_, running) = rt.block_on(established(driver, 1, offload));
                     (rt, running)
                 });
                 b.iter_custom(|iters| {
