@@ -94,16 +94,16 @@ impl TunnelConfig {
 
 /// A point-to-point WireGuard connection.
 pub struct Tunnel {
-    handshake: Handshake,
-    sessions: Sessions,
-    timers: Timers,
-    rng: ForwardSecureRng,
+    pub(crate) handshake: Handshake,
+    pub(crate) sessions: Sessions,
+    pub(crate) timers: Timers,
+    pub(crate) rng: ForwardSecureRng,
     events: RingBuffer<Event, 16>,
     first_initiation_at: Option<Instant>,
     established: bool,
 
     /// Reserves this tunnel's index in its [`Interface`](crate::Interface) while the tunnel is alive.
-    _index_lease: Arc<()>,
+    pub(crate) _index_lease: Arc<()>,
 }
 
 impl Tunnel {

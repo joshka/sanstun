@@ -96,6 +96,14 @@ impl Timers {
         Some(self[TimePersistentKeepalive] + self.persistent_keepalive?)
     }
 
+    pub(crate) fn persistent_keepalive(&self) -> Option<Duration> {
+        self.persistent_keepalive
+    }
+
+    pub(crate) fn rekey_attempt_time_setting(&self) -> Duration {
+        self.rekey_attempt_time
+    }
+
     pub(crate) fn clear(&mut self, now: Instant) {
         for t in &mut self.timers[..] {
             *t = now;

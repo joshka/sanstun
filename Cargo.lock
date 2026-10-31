@@ -892,6 +892,7 @@ dependencies = [
  "rand",
  "ring",
  "subtle",
+ "tokio",
  "tracing",
  "x25519-dalek",
  "zeroize",

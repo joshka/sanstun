@@ -8,9 +8,12 @@
 //!   messages over channels to one task per tunnel.
 //! - [`Driver::Mutex`]: tasks for the network, the TUN device and each tunnel's timers share the
 //!   [`Interface`] and tunnels behind mutexes.
+//! - [`Driver::Async`]: the demultiplexer from [`Driver::Channels`], but each tunnel task is
+//!   [`sanstun::aio::AsyncTunnel`], which replaces [`Tunnel`]'s timer state machine and
+//!   [`peer`]'s queueing with async loops.
 //!
-//! All drivers share the per-tunnel logic in [`peer`], so they differ only in how state is
-//! shared and how work is scheduled. Given the same seeds and the same schedule of inputs, they
+//! The first three drivers share the per-tunnel logic in [`peer`], so they differ only in how
+//! state is shared and how work is scheduled. The async driver reimplements that logic. Given the same seeds and the same schedule of inputs, they
 //! must produce byte-identical traffic. The tests in `tests/equivalence.rs` check this under
 //! tokio's paused clock.
 //!
@@ -24,6 +27,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
 use zeroize::Zeroizing;
 
+mod asyncd;
 mod channels;
 mod mutex;
 pub mod net;
@@ -40,16 +44,23 @@ pub enum Driver {
     SansIo,
     Channels,
     Mutex,
+    Async,
 }
 
 impl Driver {
-    pub const ALL: [Driver; 3] = [Driver::SansIo, Driver::Channels, Driver::Mutex];
+    pub const ALL: [Driver; 4] = [
+        Driver::SansIo,
+        Driver::Channels,
+        Driver::Mutex,
+        Driver::Async,
+    ];
 
     pub fn name(self) -> &'static str {
         match self {
             Driver::SansIo => "sans-io",
             Driver::Channels => "channels",
             Driver::Mutex => "mutex",
+            Driver::Async => "async",
         }
     }
 
@@ -61,6 +72,7 @@ impl Driver {
             Driver::SansIo => tokio::spawn(sansio::run(node, io)),
             Driver::Channels => tokio::spawn(channels::run(node, io)),
             Driver::Mutex => tokio::spawn(mutex::run(node, io)),
+            Driver::Async => tokio::spawn(asyncd::run(node, io)),
         }
     }
 }

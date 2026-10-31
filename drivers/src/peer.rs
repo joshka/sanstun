@@ -70,7 +70,7 @@ impl Output {
         self.event(peer, NodeEvent::Error(format!("{error:?}")));
     }
 
-    fn ip(&self, peer: PeerId, packet: Vec<u8>) {
+    pub(crate) fn ip(&self, peer: PeerId, packet: Vec<u8>) {
         let _ = self.tun.send((peer, packet));
     }
 }
@@ -94,6 +94,10 @@ impl Peer {
 
     pub(crate) fn id(&self) -> PeerId {
         self.id
+    }
+
+    pub(crate) fn into_parts(self) -> (PeerId, SocketAddr, Tunnel) {
+        (self.id, self.addr, self.tunnel)
     }
 
     pub(crate) fn tunnel_id(&self) -> TunnelId {
