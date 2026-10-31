@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use super::{AsyncTunnel, Output};
 use crate::index::Index;
-use crate::{CookieReply, Error, HandshakeInitiation, HandshakeResponse};
+use crate::{ComputedResponse, CookieReply, Error, HandshakeInitiation, HandshakeResponse};
 
 impl AsyncTunnel {
     /// Starts a handshake unless one is in progress.
@@ -47,12 +47,27 @@ impl AsyncTunnel {
         self.ensure_not_expired()?;
 
         let local_idx = self.sessions.next_index();
-        let (response, session) = self.handshake.receive_handshake_initialization(
-            &init,
-            local_idx,
-            &mut self.rng,
-            now,
-        )?;
+        let pending = self
+            .handshake
+            .begin_response(&init, local_idx, &mut self.rng, now)?;
+        if out.offloads() {
+            self.responses.push(pending);
+            return Ok(());
+        }
+
+        self.commit_response(pending.compute()?, now, out)
+    }
+
+    /// Establishes the session of a computed response and sends it.
+    pub(super) fn commit_response(
+        &mut self,
+        computed: ComputedResponse,
+        now: Instant,
+        out: &impl Output,
+    ) -> Result<(), Error> {
+        self.ensure_not_expired()?;
+
+        let (response, session) = self.handshake.commit_response(computed);
         self.sessions.insert(session);
         out.datagram(response.to_vec());
 

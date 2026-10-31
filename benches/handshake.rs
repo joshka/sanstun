@@ -45,6 +45,18 @@ fn bench_handshake(c: &mut Criterion) {
         )
     });
 
+    // Decrypting an initiation, which an interface does for every one it receives.
+    group.bench_function("receive_initiation", |bencher| {
+        bencher.iter_batched(
+            || {
+                now += STEP;
+                (a.restart_handshake(now).unwrap(), now)
+            },
+            |(initiation, now)| black_box(receive_initiation(&mut interface_b, &initiation, now)),
+            BatchSize::SmallInput,
+        )
+    });
+
     group.bench_function("handle_handshake_initiation", |bencher| {
         bencher.iter_batched(
             || {

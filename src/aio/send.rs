@@ -62,7 +62,9 @@ impl AsyncTunnel {
         }
 
         let mut buf = out.buffer(packet.len().next_multiple_of(16) + DATA_OVERHEAD_SZ);
-        let encrypted = pending.encrypt(&packet, &mut buf).map(|message| message.len());
+        let encrypted = pending
+            .encrypt(&packet, &mut buf)
+            .map(|message| message.len());
         out.recycle(packet);
         match encrypted {
             Ok(len) => {

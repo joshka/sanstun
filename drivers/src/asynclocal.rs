@@ -11,7 +11,7 @@ use sanstun::aio::Input;
 use tokio::sync::mpsc;
 
 use crate::asyncd::PeerOutput;
-use crate::peer::{BATCH, Output, Routes, now};
+use crate::peer::{BATCH, Batches, Offloaded, Output, Routes, now, recv_offloaded};
 use crate::{Node, NodeIo};
 
 /// Bounds each tunnel's inbox. The router cannot wait for space, since the tunnel that would
@@ -50,12 +50,25 @@ pub(crate) async fn run(node: Node, io: NodeIo) {
         })
         .collect::<Vec<_>>();
 
+    // The router parses initiations on rayon if offloading; tunnels offload the rest.
+    let (mut out, mut offloaded) = out.offloading(offload);
+    let mut batches = Batches::new(inboxes.len());
     let mut datagrams = Vec::with_capacity(BATCH);
     let mut packets = Vec::with_capacity(BATCH);
+    let mut parsed = Vec::with_capacity(BATCH);
     loop {
         tokio::select! {
             biased;
 
+            _ = recv_offloaded(&mut offloaded, &mut parsed) => {
+                for done in parsed.drain(..) {
+                    if let Offloaded::Initiation(Ok(init)) = done
+                        && let Some((id, message)) = routes.accept(&mut interface, init)
+                    {
+                        batches.push(id, Input::Message(message, Vec::new()));
+                    }
+                }
+            }
             Some(()) = tunnels.next() => {}
             received = udp_rx.recv_many(&mut datagrams, BATCH) => {
                 if received == 0 {
@@ -64,9 +77,9 @@ pub(crate) async fn run(node: Node, io: NodeIo) {
                 let now = now();
                 for (src, datagram) in datagrams.drain(..) {
                     if let Some((id, message)) =
-                        routes.receive(&mut interface, src, &datagram, now, &out)
+                        routes.receive(&mut interface, src, &datagram, now, &mut out)
                     {
-                        let _ = inboxes[id].try_send(Input::Message(message, datagram));
+                        batches.push(id, Input::Message(message, datagram));
                     }
                 }
             }
@@ -75,9 +88,11 @@ pub(crate) async fn run(node: Node, io: NodeIo) {
                     return;
                 }
                 for (id, packet) in packets.drain(..) {
-                    let _ = inboxes[id].try_send(Input::Ip(packet));
+                    batches.push(id, Input::Ip(packet));
                 }
             }
         }
+        out.flush_offload();
+        batches.try_forward(&inboxes);
     }
 }

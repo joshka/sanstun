@@ -36,12 +36,13 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 use crate::handshake::Handshake;
+use crate::handshake::{ComputedResponse, PendingResponse};
+use crate::message::DATA_OVERHEAD_SZ;
 use crate::message::ReceivedMessage;
 use crate::rng::ForwardSecureRng;
 use crate::session::Sessions;
-use crate::timers::TimerName;
-use crate::message::DATA_OVERHEAD_SZ;
 use crate::session::{Decrypted, PendingDecapsulate, PendingEncapsulate};
+use crate::timers::TimerName;
 use crate::{Error, Tunnel};
 use timers::Timers;
 
@@ -111,14 +112,26 @@ pub trait Output {
     fn offload_decrypt(
         &self,
         batch: Vec<(PendingDecapsulate, Vec<u8>)>,
-        done: mpsc::UnboundedSender<Decrypted<Vec<u8>>>,
+        done: mpsc::UnboundedSender<Offloaded>,
     ) {
         for (pending, datagram) in batch {
             let decrypted = pending.decrypt(&datagram, self.buffer(datagram.len()));
             self.recycle(datagram);
-            let _ = done.send(decrypted);
+            let _ = done.send(Offloaded::Decrypted(decrypted));
         }
     }
+
+    /// Computes a handshake response, for example on another thread, and sends it to `done`
+    /// for the tunnel to commit.
+    fn offload_response(&self, pending: PendingResponse, done: mpsc::UnboundedSender<Offloaded>) {
+        let _ = done.send(Offloaded::Response(pending.compute().map(Box::new)));
+    }
+}
+
+/// Work an [`Output`] finished off the tunnel's task, for the tunnel to commit.
+pub enum Offloaded {
+    Decrypted(Decrypted<Vec<u8>>),
+    Response(Result<Box<ComputedResponse>, Error>),
 }
 
 /// A tunnel that runs its own timers. Create one with [`Tunnel::into_async`].
@@ -134,6 +147,7 @@ pub struct AsyncTunnel {
     /// Data messages waiting for [`Output::offload_encrypt`] and [`Output::offload_decrypt`].
     encrypts: Vec<(PendingEncapsulate, Vec<u8>)>,
     decrypts: Vec<(PendingDecapsulate, Vec<u8>)>,
+    responses: Vec<PendingResponse>,
     established: bool,
     _index_lease: Arc<()>,
 }
@@ -164,18 +178,21 @@ impl Tunnel {
             pending: VecDeque::new(),
             encrypts: Vec::new(),
             decrypts: Vec::new(),
+            responses: Vec::new(),
             established: false,
             _index_lease: self._index_lease,
         };
         // Like sanstun's tunnels, one that never completes a handshake still expires.
         tunnel.session_derived(created_at);
+        tunnel.timers.new_handshake_jitter = tunnel.jitter();
 
         tunnel
     }
 }
 
 impl AsyncTunnel {
-    /// Runs the tunnel until `inbox` closes.
+    /// Runs the tunnel until `inbox` closes. The inbox carries batches, so that whoever routes
+    /// inputs to tunnels pays one channel operation per batch rather than per input.
     ///
     /// Returns an `async move` block rather than being an `async fn`: the block keeps the tunnel
     /// once, where an `async fn` would keep both its argument and the moved-from local.
@@ -185,12 +202,12 @@ impl AsyncTunnel {
     )]
     pub fn run(
         mut self,
-        mut inbox: mpsc::Receiver<Input>,
+        mut inbox: mpsc::Receiver<Vec<Input>>,
         out: impl Output,
     ) -> impl Future<Output = ()> {
         async move {
             let mut inputs = Vec::with_capacity(BATCH);
-            let (done, mut decrypted) = mpsc::unbounded_channel();
+            let (done, mut offloaded) = mpsc::unbounded_channel();
             let mut commits = Vec::with_capacity(BATCH);
 
             loop {
@@ -201,13 +218,20 @@ impl AsyncTunnel {
 
                     () = timers.retransmit_handshake.expired() => self.retransmit_handshake(now(), &out),
                     () = timers.send_keepalive.expired() => self.send_keepalive(now(), &out),
-                    () = timers.new_handshake.expired() => self.initiate_handshake(now(), &out),
+                    () = timers.new_handshake.expired() => self.new_handshake(now(), &out),
                     () = timers.persistent_keepalive.expired() => self.send_keepalive(now(), &out),
                     () = timers.zero_key_material.expired() => self.expire(&out),
-                    _ = decrypted.recv_many(&mut commits, BATCH) => {
+                    _ = offloaded.recv_many(&mut commits, BATCH) => {
                         let now = now();
-                        for decrypted in commits.drain(..) {
-                            if let Err(e) = self.commit(decrypted, now, &out) {
+                        for done in commits.drain(..) {
+                            let result = match done {
+                                Offloaded::Decrypted(decrypted) => {
+                                    self.commit(decrypted, now, &out)
+                                }
+                                Offloaded::Response(computed) => computed
+                                    .and_then(|computed| self.commit_response(*computed, now, &out)),
+                            };
+                            if let Err(e) = result {
                                 out.notice(Notice::Error(e));
                             }
                         }
@@ -217,7 +241,7 @@ impl AsyncTunnel {
                             return;
                         }
                         let now = now();
-                        for input in inputs.drain(..) {
+                        for input in inputs.drain(..).flatten() {
                             self.handle(input, now, &out);
                         }
                     }
@@ -229,6 +253,9 @@ impl AsyncTunnel {
                 }
                 if !self.decrypts.is_empty() {
                     out.offload_decrypt(std::mem::take(&mut self.decrypts), done.clone());
+                }
+                for pending in self.responses.drain(..) {
+                    out.offload_response(pending, done.clone());
                 }
             }
         }

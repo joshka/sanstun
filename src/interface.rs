@@ -1,5 +1,7 @@
 use crate::crypto::{b2s_hash, b2s_keyed_mac_16, b2s_keyed_mac_16_2, xaead_seal};
-use crate::handshake::{LABEL_COOKIE, LABEL_MAC1, parse_handshake_init};
+use crate::handshake::{
+    LABEL_COOKIE, LABEL_MAC1, StaticShared, parse_handshake_init, static_shared,
+};
 use crate::index::TunnelIndices;
 use crate::message::{
     COOKIE_REPLY, COOKIE_REPLY_SZ, CookieReply, DATA, DATA_OVERHEAD_SZ, HANDSHAKE_INIT,
@@ -8,11 +10,12 @@ use crate::message::{
 };
 use crate::ratelimiter::RateLimiter;
 use crate::tai64n::{Tai64N, TimeStamper};
-use crate::{Datagram, Error, PublicKey, StaticSecret, Tunnel, TunnelConfig};
+use crate::{Datagram, Error, HandshakeInitiation, PublicKey, StaticSecret, Tunnel, TunnelConfig};
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::rng::ForwardSecureRng;
@@ -47,6 +50,9 @@ pub struct Interface {
     rate_limiter: RateLimiter,
     /// The latest accepted handshake timestamp for each peer we have created a tunnel for.
     last_handshake_timestamps: HashMap<PublicKey, Tai64N>,
+    /// Static-static shared secrets with the peers we have created tunnels for. Shared with
+    /// [`PendingInitiation`]s parsed elsewhere.
+    static_shared: Arc<StaticShared>,
 }
 
 impl Interface {
@@ -79,6 +85,7 @@ impl Interface {
             indices,
             rate_limiter: RateLimiter::new(now),
             last_handshake_timestamps: HashMap::new(),
+            static_shared: Arc::default(),
         }
     }
 
@@ -90,6 +97,8 @@ impl Interface {
         self.cookie_key = b2s_hash(LABEL_COOKIE, static_public.as_bytes());
         self.static_private = static_private;
         self.static_public = static_public;
+        // Secrets for the previous key are useless now. Tunnels created later add their own.
+        self.static_shared = Arc::default();
 
         self
     }
@@ -136,6 +145,10 @@ impl Interface {
         if let Entry::Vacant(entry) = self.last_handshake_timestamps.entry(peer_static_public) {
             entry.insert(Tai64N::zero());
         }
+        if !self.static_shared.contains_key(&peer_static_public) {
+            let shared = static_shared(&self.static_private, &peer_static_public)?;
+            Arc::make_mut(&mut self.static_shared).insert(peer_static_public, shared);
+        }
 
         Ok(tunnel)
     }
@@ -171,24 +184,9 @@ impl Interface {
                     return Ok(Received::SendCookieReply(reply));
                 }
 
-                let mut init = parse_handshake_init(
-                    &self.static_private,
-                    &self.static_public,
-                    datagram.try_into().expect("handshake length was checked"),
-                )?;
+                let init = self.pending_initiation(datagram).parse()?;
 
-                if let Some(last) = self
-                    .last_handshake_timestamps
-                    .get_mut(&init.peer_static_public())
-                {
-                    if init.0.timestamp.after(last) {
-                        *last = init.0.timestamp;
-                    } else {
-                        init.0.replayed = true;
-                    }
-                }
-
-                ReceivedMessage::HandshakeInitiation(init)
+                ReceivedMessage::HandshakeInitiation(self.accept_initiation(init))
             }
             (HANDSHAKE_RESP, HANDSHAKE_RESP_SZ) => {
                 let sender_idx = u32::from_le_bytes(datagram[4..8].try_into().unwrap());
@@ -222,6 +220,58 @@ impl Interface {
         };
 
         Ok(Received::Message(message))
+    }
+
+    /// Like [`Interface::receive`], but leaves the DHs of a handshake initiation to
+    /// [`PendingInitiation::parse`], which can run on another thread.
+    ///
+    /// Pass the parsed initiation to [`Interface::accept_initiation`] before routing it.
+    pub fn receive_deferring_handshakes(
+        &mut self,
+        src_addr: SocketAddr,
+        datagram: &[u8],
+        now: Instant,
+    ) -> Result<Deferred, Error> {
+        if datagram.len() != HANDSHAKE_INIT_SZ
+            || u32::from_le_bytes(datagram[0..4].try_into().unwrap()) != HANDSHAKE_INIT
+        {
+            return self
+                .receive(src_addr, datagram, now)
+                .map(Deferred::Received);
+        }
+
+        let sender_idx = u32::from_le_bytes(datagram[4..8].try_into().unwrap());
+        if let Some(reply) = self.verify_macs(src_addr, sender_idx, datagram, now)? {
+            return Ok(Deferred::Received(Received::SendCookieReply(reply)));
+        }
+
+        Ok(Deferred::Initiation(self.pending_initiation(datagram)))
+    }
+
+    /// Marks an initiation as a replay unless it is newer than the last one accepted from its
+    /// peer, for peers we have created a tunnel for.
+    pub fn accept_initiation(&mut self, mut init: HandshakeInitiation) -> HandshakeInitiation {
+        if let Some(last) = self
+            .last_handshake_timestamps
+            .get_mut(&init.peer_static_public())
+        {
+            if init.0.timestamp.after(last) {
+                *last = init.0.timestamp;
+            } else {
+                init.0.replayed = true;
+            }
+        }
+
+        init
+    }
+
+    fn pending_initiation(&self, datagram: &[u8]) -> PendingInitiation {
+        PendingInitiation {
+            datagram: datagram.try_into().expect("handshake length was checked"),
+            static_private: self.static_private.clone(),
+            static_public: self.static_public,
+            static_shared: self.static_shared.clone(),
+        }
     }
 
     /// Verifies the MACs of a handshake message and applies rate limiting.
@@ -326,6 +376,42 @@ impl Interface {
         );
 
         dst
+    }
+}
+
+/// The result of [`Interface::receive_deferring_handshakes`].
+#[derive(Debug)]
+pub enum Deferred {
+    /// Handled as by [`Interface::receive`].
+    Received(Received),
+    /// A handshake initiation whose MACs and rate limit passed, still to be parsed.
+    Initiation(PendingInitiation),
+}
+
+/// A handshake initiation whose DHs have not been computed yet.
+pub struct PendingInitiation {
+    datagram: [u8; HANDSHAKE_INIT_SZ],
+    static_private: StaticSecret,
+    static_public: PublicKey,
+    static_shared: Arc<StaticShared>,
+}
+
+impl std::fmt::Debug for PendingInitiation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingInitiation").finish_non_exhaustive()
+    }
+}
+
+impl PendingInitiation {
+    /// Decrypts and authenticates the initiation. Pass the result to
+    /// [`Interface::accept_initiation`].
+    pub fn parse(self) -> Result<HandshakeInitiation, Error> {
+        parse_handshake_init(
+            &self.static_private,
+            &self.static_public,
+            &self.static_shared,
+            &self.datagram,
+        )
     }
 }
 

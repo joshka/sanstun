@@ -1,7 +1,8 @@
 //! Measures how long each poll of a driver's tasks runs, to find work that goes too long
 //! without reaching an `.await`.
 //!
-//! Recording is off unless [`enable`]d, so benchmarks pay one relaxed load per poll.
+//! Tasks are only wrapped with the `polls` feature, so benchmarks measure no instrumentation.
+//! Even then, recording is off unless [`enable`]d.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -77,8 +78,14 @@ pub fn stats() -> Stats {
 }
 
 /// Wraps a driver task so its polls are recorded.
+#[cfg(feature = "polls")]
 pub(crate) fn timed<F: Future>(future: F) -> Timed<F> {
     Timed { future }
+}
+
+#[cfg(not(feature = "polls"))]
+pub(crate) fn timed<F: Future>(future: F) -> F {
+    future
 }
 
 pin_project_lite::pin_project! {

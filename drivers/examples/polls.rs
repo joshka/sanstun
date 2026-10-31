@@ -2,7 +2,7 @@
 //!
 //! Tokio's guidance is to stay under 10–100µs between `.await`s, so that one task cannot
 //! hold up others on the same thread. Run with `cargo run --release -p sanstun-drivers
-//! --example polls`.
+//! --features polls --example polls`.
 
 use sanstun_drivers::net::{Network, NodeHandle};
 use sanstun_drivers::scenario::{Running, Star};

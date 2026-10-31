@@ -60,7 +60,7 @@ cargo bench -p sanstun-drivers --bench e2e -- --baseline before
 ## Time between `.await`s
 
 ```sh
-cargo run --release -p sanstun-drivers --example polls
+cargo run --release -p sanstun-drivers --features polls --example polls
 ```
 
 Prints, for each driver, how long its tasks' polls run during handshake bursts and steady

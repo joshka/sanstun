@@ -5,6 +5,10 @@ version = "0.0.0"
 edition = "2024"
 publish = false
 
+[features]
+# Records how long each poll of a driver task runs; see `examples/polls.rs`.
+polls = []
+
 [lib]
 # Keeps libtest from rejecting criterion's arguments in `cargo bench`.
 bench = false
@@ -29,3 +33,7 @@ harness = false
 [[bench]]
 name = "primitives"
 harness = false
+
+[[example]]
+name = "polls"
+required-features = ["polls"]

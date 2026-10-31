@@ -16,6 +16,8 @@ pub(super) struct Timers {
     pub(super) new_handshake: Timer,
     pub(super) persistent_keepalive: Timer,
     pub(super) zero_key_material: Timer,
+    /// Jitter added to `new_handshake`, drawn each time it fires.
+    pub(super) new_handshake_jitter: Duration,
 }
 
 impl AsyncTunnel {
@@ -49,9 +51,18 @@ impl AsyncTunnel {
 
     pub(super) fn data_sent(&mut self, now: Instant) {
         if !self.timers.new_handshake.is_armed() {
-            let timeout = self.config.keepalive_timeout + self.config.rekey_timeout + self.jitter();
+            let timeout = self.config.keepalive_timeout
+                + self.config.rekey_timeout
+                + self.timers.new_handshake_jitter;
             self.timers.new_handshake.arm(now + timeout);
         }
+    }
+
+    /// Starts a handshake when data went unanswered (§6.5).
+    pub(super) fn new_handshake(&mut self, now: Instant, out: &impl Output) {
+        // Re-arming happens on almost every packet, so jitter is drawn once per firing.
+        self.timers.new_handshake_jitter = self.jitter();
+        self.initiate_handshake(now, out);
     }
 
     pub(super) fn data_received(&mut self, now: Instant) {
@@ -90,43 +101,66 @@ impl AsyncTunnel {
 }
 
 /// A timer that can be armed for a deadline and disarmed.
+///
+/// Protocol events re-arm timers on almost every packet, nearly always to a later deadline.
+/// Re-arming to a later deadline only records it: the sleep wakes at the earlier one and goes
+/// back to sleep until the new deadline. Disarming keeps the sleep registered. Both leave
+/// tokio's timer wheel alone on the hot path.
 pub(super) struct Timer {
     sleep: Pin<Box<Sleep>>,
-    armed: bool,
+    /// When the timer fires, if armed.
+    deadline: Option<Instant>,
+    /// When the sleep wakes, if registered. Never later than `deadline`.
+    wakes_at: Option<Instant>,
 }
 
 impl Default for Timer {
     fn default() -> Self {
         Timer {
             sleep: Box::pin(tokio::time::sleep(Duration::ZERO)),
-            armed: false,
+            deadline: None,
+            wakes_at: None,
         }
     }
 }
 
 impl Timer {
     fn arm(&mut self, deadline: Instant) {
-        self.sleep.as_mut().reset(deadline.into());
-        self.armed = true;
+        self.deadline = Some(deadline);
+        if self.wakes_at.is_none_or(|wakes_at| deadline < wakes_at) {
+            self.sleep.as_mut().reset(deadline.into());
+            self.wakes_at = Some(deadline);
+        }
     }
 
-    /// Disarms the timer. The sleep stays registered until it is next armed, which is cheaper
-    /// than resetting it on every packet.
     fn disarm(&mut self) {
-        self.armed = false;
+        self.deadline = None;
     }
 
     fn is_armed(&self) -> bool {
-        self.armed
+        self.deadline.is_some()
     }
 
     /// Completes when the armed deadline passes, and never while disarmed.
     pub(super) async fn expired(&mut self) {
-        if !self.armed {
-            return std::future::pending().await;
-        }
+        loop {
+            let Some(deadline) = self.deadline else {
+                return std::future::pending().await;
+            };
+            if self.wakes_at.is_none() {
+                self.sleep.as_mut().reset(deadline.into());
+                self.wakes_at = Some(deadline);
+            }
 
-        self.sleep.as_mut().await;
-        self.armed = false;
+            self.sleep.as_mut().await;
+            self.wakes_at = None;
+            if self
+                .deadline
+                .is_some_and(|deadline| deadline <= super::now())
+            {
+                self.deadline = None;
+                return;
+            }
+        }
     }
 }

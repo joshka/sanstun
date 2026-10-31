@@ -105,8 +105,9 @@ mod timers;
 mod tunnel;
 
 pub use errors::Error;
+pub use handshake::{ComputedResponse, PendingResponse};
 pub use index::TunnelId;
-pub use interface::{Interface, Received};
+pub use interface::{Deferred, Interface, PendingInitiation, Received};
 pub use keys::{PresharedKey, PublicKey, StaticSecret};
 pub use message::{
     CookieReply, DataMessage, Datagram, HandshakeInitiation, HandshakeResponse, ReceivedMessage,

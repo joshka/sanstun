@@ -6,12 +6,12 @@
 
 use std::collections::VecDeque;
 use std::net::SocketAddr;
-use std::sync::Mutex;
 use std::time::Instant;
 
 use sanstun::{
-    Committed, Decrypted, Error, Event, Interface, PendingDecapsulate, PendingEncapsulate,
-    PublicKey, Received, ReceivedMessage, Tunnel, TunnelId,
+    Committed, ComputedResponse, Decrypted, Deferred, Error, Event, HandshakeInitiation, Interface,
+    PendingDecapsulate, PendingEncapsulate, PendingInitiation, PendingResponse, PublicKey,
+    Received, ReceivedMessage, Tunnel, TunnelId,
 };
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
@@ -54,6 +54,51 @@ pub(crate) async fn forward<T>(
     }
 }
 
+/// Inputs a router collected for each tunnel during one batch, to forward with one channel
+/// operation per tunnel rather than one per input.
+pub(crate) struct Batches<T> {
+    batches: Vec<Vec<T>>,
+    touched: Vec<PeerId>,
+}
+
+impl<T> Batches<T> {
+    pub(crate) fn new(tunnels: usize) -> Self {
+        Batches {
+            batches: (0..tunnels).map(|_| Vec::new()).collect(),
+            touched: Vec::new(),
+        }
+    }
+
+    pub(crate) fn push(&mut self, id: PeerId, input: T) {
+        let batch = &mut self.batches[id];
+        if batch.is_empty() {
+            self.touched.push(id);
+        }
+        batch.push(input);
+    }
+
+    /// Forwards every collected batch, waiting while an inbox is full.
+    pub(crate) async fn forward(
+        &mut self,
+        inboxes: &[tokio::sync::mpsc::Sender<Vec<T>>],
+    ) -> Result<(), ()> {
+        for id in self.touched.drain(..) {
+            let batch = std::mem::take(&mut self.batches[id]);
+            forward(&inboxes[id], batch).await.map_err(|_| ())?;
+        }
+
+        Ok(())
+    }
+
+    /// Forwards every collected batch, dropping those whose inbox is full, as a full socket
+    /// buffer would.
+    pub(crate) fn try_forward(&mut self, inboxes: &[tokio::sync::mpsc::Sender<Vec<T>>]) {
+        for id in self.touched.drain(..) {
+            let _ = inboxes[id].try_send(std::mem::take(&mut self.batches[id]));
+        }
+    }
+}
+
 /// Aborts a task when dropped.
 pub(crate) struct AbortOnDrop(pub(crate) tokio::task::AbortHandle);
 
@@ -72,26 +117,45 @@ pub(crate) struct Output {
     offload: Option<Offload>,
 }
 
-/// A task's batches of data messages to encrypt and decrypt on rayon's pool.
+/// A task's batches of crypto work for rayon's pool.
 pub(crate) struct Offload {
-    // Only the owning task touches these, but `&Output` crosses `.await`s, so it must be
-    // `Sync`. The locks are never contended.
-    encrypts: Mutex<Vec<(PendingEncapsulate, Vec<u8>, SocketAddr)>>,
-    decrypts: Mutex<Vec<(PeerId, PendingDecapsulate, Vec<u8>)>>,
-    /// Returns decrypted messages to the task, which owns the tunnels that commit them.
-    decrypted: UnboundedSender<(PeerId, Decrypted<Vec<u8>>)>,
+    encrypts: Vec<(PendingEncapsulate, Vec<u8>, SocketAddr)>,
+    decrypts: Vec<(PeerId, PendingDecapsulate, Vec<u8>)>,
+    responses: Vec<(PeerId, PendingResponse)>,
+    initiations: Vec<PendingInitiation>,
+    /// Returns finished work to the task, which owns the state that commits it.
+    done: UnboundedSender<Offloaded>,
 }
 
-/// Decrypted messages for a task to commit.
-pub(crate) type DecryptedRx = UnboundedReceiver<(PeerId, Decrypted<Vec<u8>>)>;
+/// Work rayon finished, for the task that owns the state to commit.
+pub(crate) enum Offloaded {
+    Decrypted(PeerId, Decrypted<Vec<u8>>),
+    Response(PeerId, Result<Box<ComputedResponse>, Error>),
+    /// A parsed initiation, for the task that owns the interface to accept and route.
+    Initiation(Result<HandshakeInitiation, Error>),
+}
 
-/// Receives decrypted messages, or never completes if the task does not offload.
-pub(crate) async fn recv_decrypted(
-    decrypted: &mut Option<DecryptedRx>,
-    commits: &mut Vec<(PeerId, Decrypted<Vec<u8>>)>,
+impl Offloaded {
+    /// Returns the peer whose tunnel commits this, or `None` for an initiation, which the
+    /// interface accepts first.
+    pub(crate) fn peer(&self) -> Option<PeerId> {
+        match self {
+            Offloaded::Decrypted(peer, _) | Offloaded::Response(peer, _) => Some(*peer),
+            Offloaded::Initiation(_) => None,
+        }
+    }
+}
+
+/// Finished work for a task to commit.
+pub(crate) type OffloadedRx = UnboundedReceiver<Offloaded>;
+
+/// Receives finished work, or never completes if the task does not offload.
+pub(crate) async fn recv_offloaded(
+    offloaded: &mut Option<OffloadedRx>,
+    commits: &mut Vec<Offloaded>,
 ) -> usize {
-    match decrypted {
-        Some(decrypted) => decrypted.recv_many(commits, BATCH).await,
+    match offloaded {
+        Some(offloaded) => offloaded.recv_many(commits, BATCH).await,
         None => std::future::pending().await,
     }
 }
@@ -120,30 +184,32 @@ impl Output {
     }
 
     /// Returns an output that batches crypto for rayon if `offload`, and the channel that
-    /// decrypted messages come back on.
-    pub(crate) fn offloading(&self, offload: bool) -> (Output, Option<DecryptedRx>) {
+    /// finished work comes back on.
+    pub(crate) fn offloading(&self, offload: bool) -> (Output, Option<OffloadedRx>) {
         let mut out = self.clone();
         if !offload {
             return (out, None);
         }
 
-        let (decrypted, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (done, rx) = tokio::sync::mpsc::unbounded_channel();
         out.offload = Some(Offload {
-            encrypts: Mutex::default(),
-            decrypts: Mutex::default(),
-            decrypted,
+            encrypts: Vec::new(),
+            decrypts: Vec::new(),
+            responses: Vec::new(),
+            initiations: Vec::new(),
+            done,
         });
 
         (out, Some(rx))
     }
 
     /// Hands the batched crypto work to rayon. Call after each batch of inputs.
-    pub(crate) fn flush_offload(&self) {
-        let Some(offload) = &self.offload else {
+    pub(crate) fn flush_offload(&mut self) {
+        let Some(offload) = &mut self.offload else {
             return;
         };
 
-        let encrypts = std::mem::take(&mut *offload.encrypts.lock().unwrap());
+        let encrypts = std::mem::take(&mut offload.encrypts);
         if !encrypts.is_empty() {
             let udp = self.udp.clone();
             rayon::spawn(move || {
@@ -158,15 +224,29 @@ impl Output {
             });
         }
 
-        let decrypts = std::mem::take(&mut *offload.decrypts.lock().unwrap());
+        let decrypts = std::mem::take(&mut offload.decrypts);
         if !decrypts.is_empty() {
-            let decrypted = offload.decrypted.clone();
+            let done = offload.done.clone();
             rayon::spawn(move || {
                 for (peer, pending, datagram) in decrypts {
                     let result = pending.decrypt(&datagram, pool::take(datagram.len()));
                     pool::recycle(datagram);
-                    let _ = decrypted.send((peer, result));
+                    let _ = done.send(Offloaded::Decrypted(peer, result));
                 }
+            });
+        }
+
+        // Each handshake costs tens of microseconds, so each gets its own job.
+        for (peer, pending) in std::mem::take(&mut offload.responses) {
+            let done = offload.done.clone();
+            rayon::spawn(move || {
+                let _ = done.send(Offloaded::Response(peer, pending.compute().map(Box::new)));
+            });
+        }
+        for pending in std::mem::take(&mut offload.initiations) {
+            let done = offload.done.clone();
+            rayon::spawn(move || {
+                let _ = done.send(Offloaded::Initiation(pending.parse()));
             });
         }
     }
@@ -227,7 +307,7 @@ impl Peer {
     }
 
     /// Encrypts an IP packet, or queues it and starts a handshake if there is no session.
-    pub(crate) fn send_ip(&mut self, packet: Vec<u8>, now: Instant, out: &Output) {
+    pub(crate) fn send_ip(&mut self, packet: Vec<u8>, now: Instant, out: &mut Output) {
         if !self.pending.is_empty() {
             self.queue(packet, now, out);
         } else if let Err(packet) = self.encrypt(packet, now, out) {
@@ -244,7 +324,7 @@ impl Peer {
         message: ReceivedMessage,
         datagram: Vec<u8>,
         now: Instant,
-        out: &Output,
+        out: &mut Output,
     ) {
         let result = match message {
             ReceivedMessage::TransportData(data) => self.decrypt(data, datagram, now, out),
@@ -264,9 +344,15 @@ impl Peer {
         &mut self,
         message: ReceivedMessage,
         now: Instant,
-        out: &Output,
+        out: &mut Output,
     ) -> Result<(), Error> {
         match message {
+            ReceivedMessage::HandshakeInitiation(init) if out.offload.is_some() => {
+                let pending = self.tunnel.begin_handshake_response(init, now)?;
+                let offload = out.offload.as_mut().unwrap();
+                offload.responses.push((self.id, pending));
+                Ok(())
+            }
             ReceivedMessage::HandshakeInitiation(init) => self
                 .tunnel
                 .handle_handshake_initiation(init, now)
@@ -280,7 +366,7 @@ impl Peer {
         }
     }
 
-    pub(crate) fn handle_timeout(&mut self, now: Instant, out: &Output) {
+    pub(crate) fn handle_timeout(&mut self, now: Instant, out: &mut Output) {
         self.tunnel.handle_timeout(now);
         self.drain_events(now, out);
     }
@@ -292,7 +378,7 @@ impl Peer {
         data: sanstun::TransportData,
         datagram: Vec<u8>,
         now: Instant,
-        out: &Output,
+        out: &mut Output,
     ) -> Result<(), Error> {
         let pending = match self.tunnel.begin_decapsulate(data, now) {
             Ok(pending) => pending,
@@ -301,12 +387,8 @@ impl Peer {
                 return Err(e);
             }
         };
-        if let Some(offload) = &out.offload {
-            offload
-                .decrypts
-                .lock()
-                .unwrap()
-                .push((self.id, pending, datagram));
+        if let Some(offload) = &mut out.offload {
+            offload.decrypts.push((self.id, pending, datagram));
             return Ok(());
         }
 
@@ -315,9 +397,16 @@ impl Peer {
         self.commit_decrypted(decrypted, now, out)
     }
 
-    /// Accepts a message that rayon decrypted.
-    pub(crate) fn commit(&mut self, decrypted: Decrypted<Vec<u8>>, now: Instant, out: &Output) {
-        if let Err(e) = self.commit_decrypted(decrypted, now, out) {
+    /// Commits work that rayon finished for this peer.
+    pub(crate) fn commit(&mut self, offloaded: Offloaded, now: Instant, out: &mut Output) {
+        let result = match offloaded {
+            Offloaded::Decrypted(_, decrypted) => self.commit_decrypted(decrypted, now, out),
+            Offloaded::Response(_, computed) => computed
+                .and_then(|computed| self.tunnel.commit_handshake_response(*computed, now))
+                .map(|response| out.datagram(self.addr, response.to_vec())),
+            Offloaded::Initiation(_) => unreachable!("initiations go to the interface"),
+        };
+        if let Err(e) = result {
             out.error(self.id, e);
         }
 
@@ -328,7 +417,7 @@ impl Peer {
         &mut self,
         decrypted: Decrypted<Vec<u8>>,
         now: Instant,
-        out: &Output,
+        out: &mut Output,
     ) -> Result<(), Error> {
         match self.tunnel.commit_decapsulate(decrypted, now)? {
             Committed::Data { mut buffer, len } => {
@@ -342,7 +431,7 @@ impl Peer {
     }
 
     /// Encrypts and sends a packet, returning it if there is no session to encrypt it with.
-    fn encrypt(&mut self, packet: Vec<u8>, now: Instant, out: &Output) -> Result<(), Vec<u8>> {
+    fn encrypt(&mut self, packet: Vec<u8>, now: Instant, out: &mut Output) -> Result<(), Vec<u8>> {
         let pending = match self.tunnel.begin_encapsulate(now) {
             Ok(pending) => pending,
             Err(Error::NoCurrentSession) => return Err(packet),
@@ -352,12 +441,8 @@ impl Peer {
             }
         };
 
-        if let Some(offload) = &out.offload {
-            offload
-                .encrypts
-                .lock()
-                .unwrap()
-                .push((pending, packet, self.addr));
+        if let Some(offload) = &mut out.offload {
+            offload.encrypts.push((pending, packet, self.addr));
             return Ok(());
         }
 
@@ -377,7 +462,7 @@ impl Peer {
         Ok(())
     }
 
-    fn queue(&mut self, packet: Vec<u8>, now: Instant, out: &Output) {
+    fn queue(&mut self, packet: Vec<u8>, now: Instant, out: &mut Output) {
         if self.pending.len() == MAX_PENDING {
             self.pending.pop_front();
         }
@@ -389,7 +474,7 @@ impl Peer {
     }
 
     /// Forwards the tunnel's events, then sends queued packets if a session is available.
-    fn drain_events(&mut self, now: Instant, out: &Output) {
+    fn drain_events(&mut self, now: Instant, out: &mut Output) {
         while let Some(event) = self.tunnel.poll_event() {
             match event {
                 Event::SendHandshakeInitiation(datagram) | Event::SendKeepalive(datagram) => {
@@ -442,9 +527,20 @@ impl Routes {
         src: SocketAddr,
         datagram: &[u8],
         now: Instant,
-        out: &Output,
+        out: &mut Output,
     ) -> Option<(PeerId, ReceivedMessage)> {
-        let message = match interface.receive(src, datagram, now) {
+        let received = match &mut out.offload {
+            Some(offload) => match interface.receive_deferring_handshakes(src, datagram, now) {
+                Ok(Deferred::Received(received)) => Ok(received),
+                Ok(Deferred::Initiation(pending)) => {
+                    offload.initiations.push(pending);
+                    return None;
+                }
+                Err(e) => Err(e),
+            },
+            None => interface.receive(src, datagram, now),
+        };
+        let message = match received {
             Ok(Received::Message(message)) => message,
             Ok(Received::SendCookieReply(reply)) => {
                 out.datagram(src, reply.to_vec());
@@ -465,6 +561,20 @@ impl Routes {
         }?;
 
         Some((*peer, message))
+    }
+}
+
+impl Routes {
+    /// Accepts an initiation that rayon parsed and finds its peer.
+    pub(crate) fn accept(
+        &self,
+        interface: &mut Interface,
+        init: HandshakeInitiation,
+    ) -> Option<(PeerId, ReceivedMessage)> {
+        let init = interface.accept_initiation(init);
+        let peer = *self.by_key.get(&init.peer_static_public())?;
+
+        Some((peer, ReceivedMessage::HandshakeInitiation(init)))
     }
 }
 

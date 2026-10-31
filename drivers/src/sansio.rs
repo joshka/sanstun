@@ -10,7 +10,7 @@ use std::pin::pin;
 use std::task::Poll;
 use std::time::Instant;
 
-use crate::peer::{BATCH, Output, Peer, Routes, now};
+use crate::peer::{BATCH, Offloaded, Output, Peer, Routes, now};
 use crate::{Node, NodeIo, PeerId};
 
 /// Iterations before the loop yields to other tasks.
@@ -22,7 +22,7 @@ pub(crate) async fn run(node: Node, mut io: NodeIo) {
         mut peers,
         offload,
     } = node;
-    let (out, mut decrypted) = Output::new(&io).offloading(offload);
+    let (mut out, mut offloaded) = Output::new(&io).offloading(offload);
     let routes = Routes::new(&peers);
     let mut timers = Timers::new(&peers);
     let mut timer = pin!(tokio::time::sleep_until(tokio::time::Instant::now()));
@@ -43,7 +43,7 @@ pub(crate) async fn run(node: Node, mut io: NodeIo) {
                 if timer.as_mut().poll(cx).is_ready() {
                     let now = now();
                     while let Some(id) = timers.pop_due(now) {
-                        peers[id].handle_timeout(now, &out);
+                        peers[id].handle_timeout(now, &mut out);
                         timers.update(&peers[id]);
                     }
                     timer_at = None;
@@ -57,9 +57,9 @@ pub(crate) async fn run(node: Node, mut io: NodeIo) {
                     let now = now();
                     for (src, datagram) in datagrams.drain(..) {
                         if let Some((id, message)) =
-                            routes.receive(&mut interface, src, &datagram, now, &out)
+                            routes.receive(&mut interface, src, &datagram, now, &mut out)
                         {
-                            peers[id].receive(message, datagram, now, &out);
+                            peers[id].receive(message, datagram, now, &mut out);
                             timers.touch(id);
                         }
                     }
@@ -73,7 +73,7 @@ pub(crate) async fn run(node: Node, mut io: NodeIo) {
                 Poll::Ready(_) => {
                     let now = now();
                     for (id, packet) in packets.drain(..) {
-                        peers[id].send_ip(packet, now, &out);
+                        peers[id].send_ip(packet, now, &mut out);
                         timers.touch(id);
                     }
                     progress = true;
@@ -81,14 +81,21 @@ pub(crate) async fn run(node: Node, mut io: NodeIo) {
                 Poll::Pending => {}
             }
 
-            if let Some(decrypted) = &mut decrypted
-                && let Poll::Ready(received) = decrypted.poll_recv_many(cx, &mut commits, BATCH)
+            if let Some(offloaded) = &mut offloaded
+                && let Poll::Ready(received) = offloaded.poll_recv_many(cx, &mut commits, BATCH)
                 && received > 0
             {
                 let now = now();
-                for (id, decrypted) in commits.drain(..) {
-                    peers[id].commit(decrypted, now, &out);
-                    timers.touch(id);
+                for done in commits.drain(..) {
+                    if let Some(id) = done.peer() {
+                        peers[id].commit(done, now, &mut out);
+                        timers.touch(id);
+                    } else if let Offloaded::Initiation(Ok(init)) = done
+                        && let Some((id, message)) = routes.accept(&mut interface, init)
+                    {
+                        peers[id].receive(message, Vec::new(), now, &mut out);
+                        timers.touch(id);
+                    }
                 }
                 progress = true;
             }

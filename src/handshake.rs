@@ -108,10 +108,24 @@ struct WriteCookie {
     received_at: Instant,
 }
 
+/// Static-static shared secrets with known peers, which never change.
+pub(crate) type StaticShared = std::collections::HashMap<PublicKey, Zeroizing<[u8; KEY_LEN]>>;
+
+/// Returns the static-static shared secret with `peer`, to cache for [`parse_handshake_init`].
+pub(crate) fn static_shared(
+    static_private: &StaticSecret,
+    peer: &PublicKey,
+) -> Result<Zeroizing<[u8; KEY_LEN]>, Error> {
+    Ok(Zeroizing::new(*dh(static_private, peer)?.as_bytes()))
+}
+
 /// Parses and authenticates a handshake initiation addressed to `static_public`.
+///
+/// Uses the cached static-static secret for known peers, which saves one of its two DHs.
 pub(crate) fn parse_handshake_init(
     static_private: &StaticSecret,
     static_public: &PublicKey,
+    known: &StaticShared,
     datagram: &[u8; HANDSHAKE_INIT_SZ],
 ) -> Result<HandshakeInitiation, Error> {
     let sender_idx = u32::from_le_bytes(datagram[4..8].try_into().unwrap());
@@ -150,8 +164,11 @@ pub(crate) fn parse_handshake_init(
     hash = b2s_hash(&hash, encrypted_static);
 
     // temp = HMAC(initiator.chaining_key, DH(initiator.static_private, responder.static_public))
-    let static_shared = dh(static_private, &peer_static_public)?;
-    let temp = b2s_hmac(&chaining_key, static_shared.as_bytes());
+    let static_shared = match known.get(&peer_static_public) {
+        Some(shared) => shared.clone(),
+        None => self::static_shared(static_private, &peer_static_public)?,
+    };
+    let temp = b2s_hmac(&chaining_key, &*static_shared);
     // initiator.chaining_key = HMAC(temp, 0x1)
     chaining_key = b2s_hmac(&temp, &[0x01]);
     // key = HMAC(temp, initiator.chaining_key || 0x2)
@@ -286,14 +303,15 @@ impl Handshake {
         initiation
     }
 
-    /// Answers a handshake initiation and establishes a session with `local_index`.
-    pub(super) fn receive_handshake_initialization(
-        &mut self,
+    /// Checks an initiation and draws the response's ephemeral key, leaving its DHs to
+    /// [`PendingResponse::compute`].
+    pub(super) fn begin_response(
+        &self,
         packet: &HandshakeInitiation,
         local_index: Index,
         rng: &mut impl CryptoRng,
         now: Instant,
-    ) -> Result<([u8; HANDSHAKE_RESP_SZ], Session), Error> {
+    ) -> Result<PendingResponse, Error> {
         let InnerHandshakeInitiation {
             // msg.sender_index = little_endian(initiator.sender_index)
             sender_idx: peer_index,
@@ -314,18 +332,31 @@ impl Handshake {
             return Err(Error::WrongKey);
         }
 
-        let (mut response, session) = self.format_handshake_response(
+        Ok(PendingResponse {
             hash,
-            chaining_key.clone(),
+            chaining_key: chaining_key.clone(),
             peer_ephemeral_public,
+            peer_static_public,
+            preshared_key: Zeroizing::new(*self.params.preshared_key.as_bytes()),
+            // responder.ephemeral_private = DH_GENERATE()
+            ephemeral_private: x25519_dalek::ReusableSecret::random_from_rng(rng),
             local_index,
             peer_index,
-            rng,
+            sending_mac1_key: self.params.sending_mac1_key,
+            write_cookie: self.cookies.write_cookie.map(|cookie| cookie.value),
             now,
-        )?;
-        self.append_mac1_and_mac2(local_index, &mut response);
+        })
+    }
 
-        Ok((response, session))
+    /// Records a computed response's `mac1` for cookie replies, and returns it with its session.
+    pub(super) fn commit_response(
+        &mut self,
+        computed: ComputedResponse,
+    ) -> ([u8; HANDSHAKE_RESP_SZ], Session) {
+        self.cookies.index = computed.local_index;
+        self.cookies.last_mac1 = Some(computed.mac1);
+
+        (computed.response, computed.session)
     }
 
     pub(super) fn receive_handshake_response(
@@ -512,20 +543,96 @@ impl Handshake {
     }
 
     /// Formats a handshake response without its MACs.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "Receives the accumulated handshake state."
-    )]
-    fn format_handshake_response(
-        &self,
-        mut hash: [u8; KEY_LEN],
-        mut chaining_key: Zeroizing<[u8; KEY_LEN]>,
-        peer_ephemeral_public: PublicKey,
-        local_index: Index,
-        peer_index: u32,
-        rng: &mut impl CryptoRng,
-        now: Instant,
-    ) -> Result<([u8; HANDSHAKE_RESP_SZ], Session), Error> {
+    /// Appends `mac1` and `mac2` to a handshake message.
+    fn append_mac1_and_mac2(&mut self, local_index: Index, dst: &mut [u8]) {
+        let cookie = self.cookies.write_cookie.map(|cookie| cookie.value);
+        let msg_mac1 = append_macs(&self.params.sending_mac1_key, cookie, dst);
+
+        self.cookies.index = local_index;
+        self.cookies.last_mac1 = Some(msg_mac1);
+    }
+}
+
+/// Appends `mac1` and `mac2` to a handshake message, and returns `mac1`.
+fn append_macs(mac1_key: &[u8; KEY_LEN], cookie: Option<[u8; 16]>, dst: &mut [u8]) -> [u8; 16] {
+    let mac1_off = dst.len() - 32;
+    let mac2_off = dst.len() - 16;
+
+    // msg.mac1 = MAC(HASH(LABEL_MAC1 || responder.static_public), msg[0:offsetof(msg.mac1)])
+    let msg_mac1 = b2s_keyed_mac_16(mac1_key, &dst[..mac1_off]);
+    dst[mac1_off..mac2_off].copy_from_slice(&msg_mac1[..]);
+
+    // msg.mac2 = MAC(initiator.last_received_cookie, msg[0:offsetof(msg.mac2)])
+    let msg_mac2: [u8; 16] = match cookie {
+        Some(cookie) => b2s_keyed_mac_16(&cookie, &dst[..mac2_off]),
+        None => [0u8; 16],
+    };
+    dst[mac2_off..].copy_from_slice(&msg_mac2[..]);
+
+    msg_mac1
+}
+
+/// A handshake response whose DHs have not been computed yet.
+///
+/// Created by [`Tunnel::begin_handshake_response`](crate::Tunnel::begin_handshake_response),
+/// which has already drawn its randomness, so it can be computed on any thread.
+#[must_use = "the response is not sent until it is computed and committed"]
+pub struct PendingResponse {
+    hash: [u8; KEY_LEN],
+    chaining_key: Zeroizing<[u8; KEY_LEN]>,
+    peer_ephemeral_public: PublicKey,
+    peer_static_public: PublicKey,
+    preshared_key: Zeroizing<[u8; KEY_LEN]>,
+    ephemeral_private: x25519_dalek::ReusableSecret,
+    local_index: Index,
+    peer_index: u32,
+    sending_mac1_key: [u8; KEY_LEN],
+    write_cookie: Option<[u8; 16]>,
+    now: Instant,
+}
+
+impl std::fmt::Debug for PendingResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingResponse")
+            .field("local_index", &self.local_index)
+            .finish_non_exhaustive()
+    }
+}
+
+/// A handshake response ready for
+/// [`Tunnel::commit_handshake_response`](crate::Tunnel::commit_handshake_response).
+#[must_use = "the response is not sent until it is committed"]
+pub struct ComputedResponse {
+    response: [u8; HANDSHAKE_RESP_SZ],
+    mac1: [u8; 16],
+    local_index: Index,
+    session: Session,
+}
+
+impl std::fmt::Debug for ComputedResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ComputedResponse")
+            .field("local_index", &self.local_index)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PendingResponse {
+    /// Computes the response's DHs and session keys.
+    pub fn compute(self) -> Result<ComputedResponse, Error> {
+        let PendingResponse {
+            mut hash,
+            mut chaining_key,
+            peer_ephemeral_public,
+            peer_static_public,
+            preshared_key,
+            ephemeral_private,
+            local_index,
+            peer_index,
+            sending_mac1_key,
+            write_cookie,
+            now,
+        } = self;
         let mut dst = [0u8; HANDSHAKE_RESP_SZ];
 
         let (message_type, rest) = dst.split_at_mut(4);
@@ -534,8 +641,6 @@ impl Handshake {
         let (unencrypted_ephemeral, rest) = rest.split_at_mut(32);
         let (encrypted_nothing, _) = rest.split_at_mut(16);
 
-        // responder.ephemeral_private = DH_GENERATE()
-        let ephemeral_private = x25519_dalek::ReusableSecret::random_from_rng(rng);
         // msg.message_type = 2
         // msg.reserved_zero = { 0, 0, 0 }
         message_type.copy_from_slice(&HANDSHAKE_RESP.to_le_bytes());
@@ -558,12 +663,12 @@ impl Handshake {
         // responder.chaining_key = HMAC(temp, 0x1)
         chaining_key = b2s_hmac(&temp, &[0x01]);
         // temp = HMAC(responder.chaining_key, DH(responder.ephemeral_private, initiator.static_public))
-        let static_shared = dh(&ephemeral_private, &self.params.peer_static_public)?;
+        let static_shared = dh(&ephemeral_private, &peer_static_public)?;
         let temp = b2s_hmac(&chaining_key, static_shared.as_bytes());
         // responder.chaining_key = HMAC(temp, 0x1)
         chaining_key = b2s_hmac(&temp, &[0x01]);
         // temp = HMAC(responder.chaining_key, preshared_key)
-        let temp = b2s_hmac(&chaining_key, self.params.preshared_key.as_bytes());
+        let temp = b2s_hmac(&chaining_key, &*preshared_key);
         // responder.chaining_key = HMAC(temp, 0x1)
         chaining_key = b2s_hmac(&temp, &[0x01]);
         // temp2 = HMAC(temp, responder.chaining_key || 0x2)
@@ -576,10 +681,13 @@ impl Handshake {
         aead_chacha20_seal(encrypted_nothing, &key, 0, &[], &hash);
 
         let (temp2, temp3) = derive_transport_keys(&chaining_key);
+        let mac1 = append_macs(&sending_mac1_key, write_cookie, &mut dst);
 
-        Ok((
-            dst,
-            Session::new(
+        Ok(ComputedResponse {
+            response: dst,
+            mac1,
+            local_index,
+            session: Session::new(
                 local_index,
                 Index::from_peer(peer_index),
                 &temp2,
@@ -587,30 +695,6 @@ impl Handshake {
                 Role::Responder,
                 now,
             ),
-        ))
-    }
-
-    /// Appends `mac1` and `mac2` to a handshake message.
-    fn append_mac1_and_mac2(&mut self, local_index: Index, dst: &mut [u8]) {
-        let mac1_off = dst.len() - 32;
-        let mac2_off = dst.len() - 16;
-
-        // msg.mac1 = MAC(HASH(LABEL_MAC1 || responder.static_public), msg[0:offsetof(msg.mac1)])
-        let msg_mac1 = b2s_keyed_mac_16(&self.params.sending_mac1_key, &dst[..mac1_off]);
-
-        dst[mac1_off..mac2_off].copy_from_slice(&msg_mac1[..]);
-
-        // msg.mac2 = MAC(initiator.last_received_cookie, msg[0:offsetof(msg.mac2)])
-        let msg_mac2: [u8; 16] =
-            if let Some(WriteCookie { value: cookie, .. }) = self.cookies.write_cookie {
-                b2s_keyed_mac_16(&cookie, &dst[..mac2_off])
-            } else {
-                [0u8; 16]
-            };
-
-        dst[mac2_off..].copy_from_slice(&msg_mac2[..]);
-
-        self.cookies.index = local_index;
-        self.cookies.last_mac1 = Some(msg_mac1);
+        })
     }
 }

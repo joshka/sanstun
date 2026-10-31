@@ -1,5 +1,5 @@
 use crate::errors::Error;
-use crate::handshake::Handshake;
+use crate::handshake::{ComputedResponse, Handshake, PendingResponse};
 use crate::index::{Index, TunnelId};
 use crate::keys::{PresharedKey, PublicKey, StaticSecret};
 use crate::message::{
@@ -288,6 +288,20 @@ impl Tunnel {
         p: HandshakeInitiation,
         now: Instant,
     ) -> Result<Datagram, Error> {
+        let computed = self.begin_handshake_response(p, now)?.compute()?;
+
+        self.commit_handshake_response(computed, now)
+    }
+
+    /// Checks a handshake initiation and prepares the response, leaving its DHs to
+    /// [`PendingResponse::compute`], which can run on another thread.
+    ///
+    /// Pass the computed response to [`Tunnel::commit_handshake_response`].
+    pub fn begin_handshake_response(
+        &mut self,
+        p: HandshakeInitiation,
+        now: Instant,
+    ) -> Result<PendingResponse, Error> {
         if p.0.replayed {
             return Err(Error::ReplayedHandshakeInitiation);
         }
@@ -299,9 +313,21 @@ impl Tunnel {
         tracing::debug!(%remote_idx, "Received handshake initiation");
 
         let local_idx = self.sessions.next_index();
-        let (packet, session) =
-            self.handshake
-                .receive_handshake_initialization(&p, local_idx, &mut self.rng, now)?;
+        self.handshake
+            .begin_response(&p, local_idx, &mut self.rng, now)
+    }
+
+    /// Establishes the session of a computed handshake response and returns the response to
+    /// send back on the path the initiation arrived on.
+    pub fn commit_handshake_response(
+        &mut self,
+        computed: ComputedResponse,
+        now: Instant,
+    ) -> Result<Datagram, Error> {
+        self.ensure_not_expired()?;
+
+        let (packet, session) = self.handshake.commit_response(computed);
+        let local_idx = session.receiving_index();
 
         self.sessions.insert(session);
 
@@ -309,7 +335,7 @@ impl Tunnel {
         self.timers.tick(TimerName::TimeLastPacketSent, now);
         self.timers.tick(TimerName::TimeLastHandshakeCompleted, now);
 
-        tracing::debug!(%local_idx, %remote_idx, "Sending handshake response");
+        tracing::debug!(%local_idx, "Sending handshake response");
 
         Ok(Datagram::new(packet))
     }

@@ -9,7 +9,9 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
 use tokio::task::JoinSet;
 
-use crate::peer::{AbortOnDrop, BATCH, Output, Peer, Routes, now, recv_decrypted, sleep_until};
+use crate::peer::{
+    AbortOnDrop, BATCH, Offloaded, Output, Peer, Routes, now, recv_offloaded, sleep_until,
+};
 use crate::{Node, NodeIo};
 
 struct Shared {
@@ -51,14 +53,14 @@ pub(crate) async fn run(node: Node, io: NodeIo) {
     // Stops the node once the TUN device closes.
     let mut tun = tokio::spawn(crate::polls::timed({
         let peers = peers.clone();
-        let (out, _) = out.offloading(offload);
+        let (mut out, _) = out.offloading(offload);
         async move {
             let mut packets = Vec::with_capacity(BATCH);
             while tun_rx.recv_many(&mut packets, BATCH).await > 0 {
                 let now = now();
                 for (id, packet) in packets.drain(..) {
                     let shared = &peers[id];
-                    shared.peer.lock().unwrap().send_ip(packet, now, &out);
+                    shared.peer.lock().unwrap().send_ip(packet, now, &mut out);
                     shared.deadline_changed.notify_one();
                 }
                 out.flush_offload();
@@ -67,7 +69,7 @@ pub(crate) async fn run(node: Node, io: NodeIo) {
     }));
     let _tun = AbortOnDrop(tun.abort_handle());
 
-    let (out, mut decrypted) = out.offloading(offload);
+    let (mut out, mut offloaded) = out.offloading(offload);
     let mut datagrams = Vec::with_capacity(BATCH);
     let mut commits = Vec::with_capacity(BATCH);
     loop {
@@ -75,11 +77,26 @@ pub(crate) async fn run(node: Node, io: NodeIo) {
             biased;
 
             _ = &mut tun => return,
-            _ = recv_decrypted(&mut decrypted, &mut commits) => {
+            _ = recv_offloaded(&mut offloaded, &mut commits) => {
                 let now = now();
-                for (id, decrypted) in commits.drain(..) {
+                for done in commits.drain(..) {
+                    let (id, done) = match done.peer() {
+                        Some(id) => (id, done),
+                        None => {
+                            let Offloaded::Initiation(Ok(init)) = done else { continue };
+                            let Some((id, message)) =
+                                routes.accept(&mut interface.lock().unwrap(), init)
+                            else {
+                                continue;
+                            };
+                            let shared = &peers[id];
+                            shared.peer.lock().unwrap().receive(message, Vec::new(), now, &mut out);
+                            shared.deadline_changed.notify_one();
+                            continue;
+                        }
+                    };
                     let shared = &peers[id];
-                    shared.peer.lock().unwrap().commit(decrypted, now, &out);
+                    shared.peer.lock().unwrap().commit(done, now, &mut out);
                     shared.deadline_changed.notify_one();
                 }
             }
@@ -90,14 +107,14 @@ pub(crate) async fn run(node: Node, io: NodeIo) {
                 let now = now();
                 for (src, datagram) in datagrams.drain(..) {
                     let routed =
-                        routes.receive(&mut interface.lock().unwrap(), src, &datagram, now, &out);
+                        routes.receive(&mut interface.lock().unwrap(), src, &datagram, now, &mut out);
                     if let Some((id, message)) = routed {
                         let shared = &peers[id];
                         shared
                             .peer
                             .lock()
                             .unwrap()
-                            .receive(message, datagram, now, &out);
+                            .receive(message, datagram, now, &mut out);
                         shared.deadline_changed.notify_one();
                     }
                 }
@@ -107,7 +124,7 @@ pub(crate) async fn run(node: Node, io: NodeIo) {
     }
 }
 
-async fn timer(shared: Arc<Shared>, out: Output) {
+async fn timer(shared: Arc<Shared>, mut out: Output) {
     loop {
         let deadline = shared.peer.lock().unwrap().poll_timeout();
 
@@ -115,7 +132,7 @@ async fn timer(shared: Arc<Shared>, out: Output) {
             biased;
 
             () = sleep_until(deadline) => {
-                shared.peer.lock().unwrap().handle_timeout(now(), &out);
+                shared.peer.lock().unwrap().handle_timeout(now(), &mut out);
             }
             () = shared.deadline_changed.notified() => {}
         }

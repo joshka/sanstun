@@ -1,16 +1,15 @@
 //! (b) One task per tunnel, fed by a demultiplexer over channels.
 //!
 //! The demultiplexer owns the [`Interface`](sanstun::Interface), which every inbound datagram
-//! has to pass through for its rate limiter and replay checks, and forwards each parsed message
-//! to its tunnel's task. A second task forwards IP packets from the TUN device.
+//! has to pass through for its rate limiter and replay checks. It also reads IP packets from the
+//! TUN device, and forwards each tunnel's inputs to its task in batches.
 
 use sanstun::ReceivedMessage;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 
 use crate::peer::{
-    AbortOnDrop, BATCH, DecryptedRx, Output, Peer, Routes, forward, now, recv_decrypted,
-    sleep_until,
+    BATCH, Batches, Offloaded, OffloadedRx, Output, Peer, Routes, now, recv_offloaded, sleep_until,
 };
 use crate::{Node, NodeIo};
 
@@ -48,54 +47,61 @@ pub(crate) async fn run(node: Node, io: NodeIo) {
         })
         .collect::<Vec<_>>();
 
-    // Stops the node once the TUN device closes.
-    let tun_inboxes = inboxes.clone();
-    let mut tun = tokio::spawn(crate::polls::timed(async move {
-        let mut packets = Vec::with_capacity(BATCH);
-        while tun_rx.recv_many(&mut packets, BATCH).await > 0 {
-            for (id, packet) in packets.drain(..) {
-                if forward(&tun_inboxes[id], Input::Ip(packet)).await.is_err() {
-                    return;
-                }
-            }
-        }
-    }));
-    let _tun = AbortOnDrop(tun.abort_handle());
-
+    // One router reads both the network and the TUN device, and forwards what it read to
+    // each tunnel as a single batch.
+    let (mut out, mut offloaded) = out.offloading(offload);
+    let mut batches = Batches::new(inboxes.len());
     let mut datagrams = Vec::with_capacity(BATCH);
+    let mut packets = Vec::with_capacity(BATCH);
+    let mut parsed = Vec::with_capacity(BATCH);
     loop {
         tokio::select! {
             biased;
 
-            _ = &mut tun => return,
+            _ = recv_offloaded(&mut offloaded, &mut parsed) => {
+                for done in parsed.drain(..) {
+                    if let Offloaded::Initiation(Ok(init)) = done
+                        && let Some((id, message)) = routes.accept(&mut interface, init)
+                    {
+                        batches.push(id, Input::Message(message, Vec::new()));
+                    }
+                }
+            }
             received = udp_rx.recv_many(&mut datagrams, BATCH) => {
                 if received == 0 {
                     return;
                 }
                 let now = now();
                 for (src, datagram) in datagrams.drain(..) {
-                    let Some((id, message)) =
-                        routes.receive(&mut interface, src, &datagram, now, &out)
-                    else {
-                        continue;
-                    };
-                    if forward(&inboxes[id], Input::Message(message, datagram))
-                        .await
-                        .is_err()
+                    if let Some((id, message)) =
+                        routes.receive(&mut interface, src, &datagram, now, &mut out)
                     {
-                        return;
+                        batches.push(id, Input::Message(message, datagram));
                     }
                 }
             }
+            received = tun_rx.recv_many(&mut packets, BATCH) => {
+                // The node stops once the TUN device closes.
+                if received == 0 {
+                    return;
+                }
+                for (id, packet) in packets.drain(..) {
+                    batches.push(id, Input::Ip(packet));
+                }
+            }
+        }
+        out.flush_offload();
+        if batches.forward(&inboxes).await.is_err() {
+            return;
         }
     }
 }
 
 async fn tunnel(
     mut peer: Peer,
-    mut inbox: mpsc::Receiver<Input>,
-    out: Output,
-    mut decrypted: Option<DecryptedRx>,
+    mut inbox: mpsc::Receiver<Vec<Input>>,
+    mut out: Output,
+    mut offloaded: Option<OffloadedRx>,
 ) {
     let mut inputs = Vec::with_capacity(BATCH);
     let mut commits = Vec::with_capacity(BATCH);
@@ -103,11 +109,11 @@ async fn tunnel(
         tokio::select! {
             biased;
 
-            () = sleep_until(peer.poll_timeout()) => peer.handle_timeout(now(), &out),
-            _ = recv_decrypted(&mut decrypted, &mut commits) => {
+            () = sleep_until(peer.poll_timeout()) => peer.handle_timeout(now(), &mut out),
+            _ = recv_offloaded(&mut offloaded, &mut commits) => {
                 let now = now();
-                for (_, decrypted) in commits.drain(..) {
-                    peer.commit(decrypted, now, &out);
+                for done in commits.drain(..) {
+                    peer.commit(done, now, &mut out);
                 }
             }
             received = inbox.recv_many(&mut inputs, BATCH) => {
@@ -115,12 +121,12 @@ async fn tunnel(
                     return;
                 }
                 let now = now();
-                for input in inputs.drain(..) {
+                for input in inputs.drain(..).flatten() {
                     match input {
                         Input::Message(message, datagram) => {
-                            peer.receive(message, datagram, now, &out);
+                            peer.receive(message, datagram, now, &mut out);
                         }
-                        Input::Ip(packet) => peer.send_ip(packet, now, &out),
+                        Input::Ip(packet) => peer.send_ip(packet, now, &mut out),
                     }
                 }
             }
