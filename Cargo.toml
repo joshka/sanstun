@@ -8,6 +8,9 @@ repository = "https://github.com/firezone/sanstun"
 edition = "2024"
 rust-version = "1.89"
 
+[workspace]
+members = ["drivers"]
+
 [dependencies]
 tracing = "0.1.44"
 ring = "0.17"
