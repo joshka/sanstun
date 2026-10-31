@@ -1,8 +1,8 @@
 //! An in-memory network that connects nodes and optionally records their traffic.
 
 use std::collections::VecDeque;
-use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -94,15 +94,18 @@ impl NetworkBuilder {
         let mut inbound = Inbound::default();
         let mut nodes = Vec::new();
         let mut outbound = Vec::new();
+        let mut ports = Vec::new();
         for &addr in &self.nodes {
+            let port = Arc::new(AtomicU16::new(addr.port()));
+            ports.push((addr, port.clone()));
             let (udp_in_tx, udp_rx) = mpsc::unbounded_channel();
             let (udp_tx, udp_out_rx) = mpsc::unbounded_channel();
             let (tun_in, tun_rx) = mpsc::unbounded_channel();
             let (tun_tx, mut tun_out) = mpsc::unbounded_channel();
             let (events_tx, mut events) = mpsc::unbounded_channel();
 
-            inbound.insert(addr, udp_in_tx);
-            outbound.push((addr, udp_out_rx));
+            inbound.insert(addr.ip(), (udp_in_tx, port.clone()));
+            outbound.push((addr, port, udp_out_rx));
 
             let (tun_out, events) = match &recorder {
                 Some(recorder) => {
@@ -145,9 +148,10 @@ impl NetworkBuilder {
         }
 
         let inbound = Arc::new(inbound);
-        for (from, rx) in outbound {
+        for (from, port, rx) in outbound {
             tokio::spawn(link(
                 from,
+                port,
                 rx,
                 inbound.clone(),
                 self.latency,
@@ -156,30 +160,39 @@ impl NetworkBuilder {
             ));
         }
 
-        let network = Network { link_up, recorder };
+        let network = Network {
+            link_up,
+            recorder,
+            ports,
+        };
 
         (network, nodes)
     }
 }
 
-/// Each node's inbound datagram queue, by address.
-type Inbound = crate::pool::FastMap<SocketAddr, UnboundedSender<(SocketAddr, Vec<u8>)>>;
+/// Each node's inbound datagram queue and current port, by address.
+type Inbound =
+    crate::pool::FastMap<IpAddr, (UnboundedSender<(SocketAddr, Vec<u8>)>, Arc<AtomicU16>)>;
 
 /// Carries one node's outbound datagrams to their destinations.
 async fn link(
     from: SocketAddr,
+    port: Arc<AtomicU16>,
     mut rx: UnboundedReceiver<(SocketAddr, Vec<u8>)>,
     inbound: Arc<Inbound>,
     latency: Duration,
     link_up: Arc<AtomicBool>,
     recorder: Option<Recorder>,
 ) {
-    let deliver = |to: SocketAddr, bytes: Vec<u8>| {
-        if let Some(tx) = inbound.get(&to) {
+    // A node only receives on its current port, as behind a NAT that rebound it.
+    let deliver = |from: SocketAddr, to: SocketAddr, bytes: Vec<u8>| {
+        if let Some((tx, port)) = inbound.get(&to.ip())
+            && port.load(Ordering::Relaxed) == to.port()
+        {
             let _ = tx.send((from, bytes));
         }
     };
-    let mut in_flight = VecDeque::<(Instant, SocketAddr, Vec<u8>)>::new();
+    let mut in_flight = VecDeque::<(Instant, SocketAddr, SocketAddr, Vec<u8>)>::new();
 
     loop {
         let next_arrival = in_flight.front().map(|(at, ..)| *at);
@@ -193,11 +206,12 @@ async fn link(
                     None => std::future::pending().await,
                 }
             } => {
-                let (_, to, bytes) = in_flight.pop_front().unwrap();
-                deliver(to, bytes);
+                let (_, from, to, bytes) = in_flight.pop_front().unwrap();
+                deliver(from, to, bytes);
             }
             datagram = rx.recv() => {
                 let Some((to, bytes)) = datagram else { return };
+                let from = SocketAddr::new(from.ip(), port.load(Ordering::Relaxed));
 
                 if let Some(recorder) = &recorder {
                     recorder.record(Record::Wire { from, to, bytes: bytes.clone() });
@@ -207,9 +221,9 @@ async fn link(
                 }
 
                 if latency.is_zero() {
-                    deliver(to, bytes);
+                    deliver(from, to, bytes);
                 } else {
-                    in_flight.push_back((Instant::now() + latency, to, bytes));
+                    in_flight.push_back((Instant::now() + latency, from, to, bytes));
                 }
             }
         }
@@ -219,6 +233,8 @@ async fn link(
 pub struct Network {
     link_up: Arc<AtomicBool>,
     recorder: Option<Recorder>,
+    /// Each node's current port.
+    ports: Vec<(SocketAddr, Arc<AtomicU16>)>,
 }
 
 impl Network {
@@ -237,6 +253,17 @@ impl Network {
 
     pub fn heal(&self) {
         self.link_up.store(true, Ordering::Relaxed);
+    }
+
+    /// Moves the node at `addr` to `port`, as a NAT rebinding does: it sends from the new port,
+    /// and datagrams to the old one are lost.
+    pub fn rebind(&self, addr: SocketAddr, port: u16) {
+        let (_, current) = self
+            .ports
+            .iter()
+            .find(|(node, _)| *node == addr)
+            .expect("the node is on this network");
+        current.store(port, Ordering::Relaxed);
     }
 
     /// Returns everything recorded so far.

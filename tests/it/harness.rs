@@ -589,6 +589,12 @@ impl Sim {
             match event {
                 sanstun::Event::SendHandshakeInitiation(datagram)
                 | sanstun::Event::SendKeepalive(datagram) => outgoing.push(datagram.to_vec()),
+                sanstun::Event::ComputeHandshakeInitiation(pending) => {
+                    if let Some(datagram) = node.tunn.commit_handshake_initiation(pending.compute())
+                    {
+                        outgoing.push(datagram.to_vec());
+                    }
+                }
                 sanstun::Event::Established {
                     started_at,
                     confirmed_at,

@@ -59,7 +59,7 @@ pub(crate) async fn run(node: Node, mut io: NodeIo) {
                         if let Some((id, message)) =
                             routes.receive(&mut interface, src, &datagram, now, &mut out)
                         {
-                            peers[id].receive(message, datagram, now, &mut out);
+                            peers[id].receive(message, datagram, src, now, &mut out);
                             timers.touch(id);
                         }
                     }
@@ -90,10 +90,10 @@ pub(crate) async fn run(node: Node, mut io: NodeIo) {
                     if let Some(id) = done.peer() {
                         peers[id].commit(done, now, &mut out);
                         timers.touch(id);
-                    } else if let Offloaded::Initiation(Ok(init)) = done
+                    } else if let Offloaded::Initiation(Ok(init), src) = done
                         && let Some((id, message)) = routes.accept(&mut interface, init)
                     {
-                        peers[id].receive(message, Vec::new(), now, &mut out);
+                        peers[id].receive(message, Vec::new(), src, now, &mut out);
                         timers.touch(id);
                     }
                 }

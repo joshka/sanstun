@@ -105,7 +105,10 @@ mod timers;
 mod tunnel;
 
 pub use errors::Error;
-pub use handshake::{ComputedResponse, PendingResponse};
+pub use handshake::{
+    CompletedHandshake, ComputedOutgoingInitiation, ComputedResponse, PendingCompletion,
+    PendingOutgoingInitiation, PendingResponse,
+};
 pub use index::TunnelId;
 pub use interface::{Deferred, Interface, PendingInitiation, Received};
 pub use keys::{PresharedKey, PublicKey, StaticSecret};

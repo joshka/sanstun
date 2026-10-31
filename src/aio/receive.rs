@@ -1,5 +1,6 @@
 //! Receiving data (§5.4.6).
 
+use std::net::SocketAddr;
 use std::time::Instant;
 
 use super::{AsyncTunnel, Notice, Output};
@@ -16,6 +17,7 @@ impl AsyncTunnel {
         &mut self,
         data: TransportData,
         datagram: Vec<u8>,
+        src: SocketAddr,
         now: Instant,
         out: &impl Output,
     ) -> Result<(), Error> {
@@ -35,19 +37,21 @@ impl AsyncTunnel {
             }
         };
         if out.offloads() {
-            self.decrypts.push((pending, datagram));
+            self.decrypts.push((pending, datagram, src));
             return Ok(());
         }
 
         let decrypted = pending.decrypt(&datagram, out.buffer(datagram.len()));
         out.recycle(datagram);
-        self.commit(decrypted, now, out)
+        self.commit(decrypted, src, now, out)
     }
 
-    /// Accepts a decrypted data message.
+    /// Accepts a decrypted data message from `src`. Once it is authenticated, the peer is at
+    /// `src`.
     pub(super) fn commit(
         &mut self,
         decrypted: Decrypted<Vec<u8>>,
+        src: SocketAddr,
         now: Instant,
         out: &impl Output,
     ) -> Result<(), Error> {
@@ -73,6 +77,7 @@ impl AsyncTunnel {
                     - self.config.keepalive_timeout
                     - self.config.rekey_timeout;
 
+        self.endpoint = src;
         self.sessions.set_current(remote_idx);
         self.packet_received(now);
         self.confirm_first_session(out);
@@ -81,7 +86,7 @@ impl AsyncTunnel {
             self.data_received(now);
         }
         if rekey {
-            self.initiate_handshake(now, out);
+            self.initiate_handshake();
         }
 
         Ok(())

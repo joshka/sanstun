@@ -11,7 +11,6 @@ use crate::timers::{MAX_JITTER, REJECT_AFTER_TIME};
 
 #[derive(Default)]
 pub(super) struct Timers {
-    pub(super) retransmit_handshake: Timer,
     pub(super) send_keepalive: Timer,
     pub(super) new_handshake: Timer,
     pub(super) persistent_keepalive: Timer,
@@ -21,20 +20,12 @@ pub(super) struct Timers {
 }
 
 impl AsyncTunnel {
-    /// Retries an unanswered initiation, giving up `REKEY_ATTEMPT_TIME` after the first (§6.4).
-    pub(super) fn retransmit_handshake(&mut self, now: Instant, out: &impl Output) {
-        if now >= self.handshake_started_at + self.config.rekey_attempt_time {
-            return self.expire(out);
-        }
-
-        self.send_initiation(now, out);
-    }
-
     /// Drops all key material, `REJECT_AFTER_TIME * 3` after the last session was derived.
     pub(super) fn expire(&mut self, out: &impl Output) {
         self.handshake.set_expired();
         self.sessions.clear();
         self.pending.clear();
+        self.round = None;
         self.timers = Timers::default();
         out.notice(Notice::Expired);
     }
@@ -59,10 +50,10 @@ impl AsyncTunnel {
     }
 
     /// Starts a handshake when data went unanswered (§6.5).
-    pub(super) fn new_handshake(&mut self, now: Instant, out: &impl Output) {
+    pub(super) fn new_handshake(&mut self) {
         // Re-arming happens on almost every packet, so jitter is drawn once per firing.
-        self.timers.new_handshake_jitter = self.jitter();
-        self.initiate_handshake(now, out);
+        self.timers.new_handshake_jitter = jitter(&mut self.rng);
+        self.initiate_handshake();
     }
 
     pub(super) fn data_received(&mut self, now: Instant) {
@@ -79,25 +70,16 @@ impl AsyncTunnel {
         }
     }
 
-    pub(super) fn initiation_sent(&mut self, now: Instant) {
-        let timeout = self.config.rekey_timeout + self.jitter();
-        self.timers.retransmit_handshake.arm(now + timeout);
-        self.packet_sent(now);
-    }
-
-    pub(super) fn handshake_complete(&mut self) {
-        self.timers.retransmit_handshake.disarm();
-    }
-
     pub(super) fn session_derived(&mut self, now: Instant) {
         self.timers
             .zero_key_material
             .arm(now + REJECT_AFTER_TIME * 3);
     }
+}
 
-    pub(super) fn jitter(&mut self) -> Duration {
-        self.rng.random_range(Duration::ZERO..=MAX_JITTER)
-    }
+/// Draws the jitter that §6.1 adds to handshake timers.
+pub(super) fn jitter(rng: &mut impl rand::Rng) -> Duration {
+    rng.random_range(Duration::ZERO..=MAX_JITTER)
 }
 
 /// A timer that can be armed for a deadline and disarmed.

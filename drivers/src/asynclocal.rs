@@ -41,11 +41,10 @@ pub(crate) async fn run(node: Node, io: NodeIo) {
             let (tx, rx) = mpsc::channel(INBOX);
             let out = PeerOutput {
                 id,
-                addr,
                 out: out.clone(),
                 offload,
             };
-            tunnels.push(tunnel.into_async().run(rx, out));
+            tunnels.push(tunnel.into_async(addr).run(rx, out));
             tx
         })
         .collect::<Vec<_>>();
@@ -62,10 +61,10 @@ pub(crate) async fn run(node: Node, io: NodeIo) {
 
             _ = recv_offloaded(&mut offloaded, &mut parsed) => {
                 for done in parsed.drain(..) {
-                    if let Offloaded::Initiation(Ok(init)) = done
+                    if let Offloaded::Initiation(Ok(init), src) = done
                         && let Some((id, message)) = routes.accept(&mut interface, init)
                     {
-                        batches.push(id, Input::Message(message, Vec::new()));
+                        batches.push(id, Input::Message(message, Vec::new(), src));
                     }
                 }
             }
@@ -79,7 +78,7 @@ pub(crate) async fn run(node: Node, io: NodeIo) {
                     if let Some((id, message)) =
                         routes.receive(&mut interface, src, &datagram, now, &mut out)
                     {
-                        batches.push(id, Input::Message(message, datagram));
+                        batches.push(id, Input::Message(message, datagram, src));
                     }
                 }
             }

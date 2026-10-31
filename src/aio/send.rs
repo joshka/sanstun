@@ -12,18 +12,18 @@ impl AsyncTunnel {
     /// Encrypts a packet, or queues it and starts a handshake if there is no session (§6.4).
     pub(super) fn send_ip(&mut self, packet: Vec<u8>, now: Instant, out: &impl Output) {
         if !self.pending.is_empty() {
-            self.queue(packet, now, out);
+            self.queue(packet);
         } else if let Err(packet) = self.encrypt(packet, now, out) {
-            self.queue(packet, now, out);
+            self.queue(packet);
         }
     }
 
-    fn queue(&mut self, packet: Vec<u8>, now: Instant, out: &impl Output) {
+    fn queue(&mut self, packet: Vec<u8>) {
         if self.pending.len() == MAX_PENDING {
             self.pending.pop_front();
         }
         self.pending.push_back(packet);
-        self.initiate_handshake(now, out);
+        self.initiate_handshake();
     }
 
     /// Sends queued packets while a session is available.
@@ -56,7 +56,7 @@ impl AsyncTunnel {
             self.packet_sent(now);
             self.data_sent(now);
             if rekey {
-                self.initiate_handshake(now, out);
+                self.initiate_handshake();
             }
             return Ok(());
         }
@@ -69,14 +69,14 @@ impl AsyncTunnel {
         match encrypted {
             Ok(len) => {
                 buf.truncate(len);
-                out.datagram(buf);
+                out.datagram(self.endpoint, buf);
             }
             Err(e) => out.notice(Notice::Error(e)),
         }
         self.packet_sent(now);
         self.data_sent(now);
         if rekey {
-            self.initiate_handshake(now, out);
+            self.initiate_handshake();
         }
 
         Ok(())
@@ -109,7 +109,7 @@ impl AsyncTunnel {
             .encrypt_payload(&[], &mut keepalive)
             .is_ok()
         {
-            out.datagram(keepalive);
+            out.datagram(self.endpoint, keepalive);
             self.packet_sent(now);
         }
     }

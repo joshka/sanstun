@@ -125,6 +125,11 @@ pub enum Step {
     },
     Cut,
     Heal,
+    /// Moves a node to another port, as a NAT rebinding does.
+    Rebind {
+        node: usize,
+        port: u16,
+    },
 }
 
 /// Runs `steps` against `star` and returns the recorded transcript.
@@ -151,6 +156,7 @@ pub async fn run(driver: Driver, star: &Star, latency: Duration, steps: &[Step])
             }
             Step::Cut => running.network.cut(),
             Step::Heal => running.network.heal(),
+            Step::Rebind { node, port } => running.network.rebind(star.addr(*node), *port),
         }
     }
     // Let everything in flight settle.

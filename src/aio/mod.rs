@@ -6,15 +6,16 @@
 //!
 //! | Timer                  | Armed when                         | Disarmed when                 |
 //! | ---------------------- | ---------------------------------- | ----------------------------- |
-//! | `retransmit_handshake` | an initiation is sent              | a handshake completes         |
 //! | `send_keepalive`       | data arrives without a reply       | any packet is sent            |
 //! | `new_handshake`        | data is sent without a reply       | any packet arrives            |
 //! | `persistent_keepalive` | any packet is sent or arrives      |                               |
 //! | `zero_key_material`    | a session is derived               |                               |
 //!
 //! Rekeying by age or message count happens on sending or receiving, as §6.2 describes, so it
-//! needs no timer. [`AsyncTunnel::run`] selects over the inbox and the timers and handles
-//! whichever is ready.
+//! needs no timer. Retrying an unanswered initiation is a loop in one future per round of
+//! attempts (§6.4), which keeps the attempts it sent and when the round began in its locals.
+//! [`AsyncTunnel::run`] selects over the inbox, the timers and the round, and handles whichever
+//! is ready.
 //!
 //! The tunnel is an actor: it owns its state, and the rest of the program talks to it through
 //! its inbox and [`Output`].
@@ -22,7 +23,7 @@
 //! - [`timers`]: the timers and the events that arm and disarm them.
 //! - [`send`]: encrypting data, or queueing it behind a handshake.
 //! - [`receive`]: decrypting data.
-//! - [`handshake`]: initiating, answering and completing handshakes.
+//! - [`handshake`]: rounds of initiations, and answering and completing handshakes.
 
 mod handshake;
 mod receive;
@@ -30,6 +31,7 @@ mod send;
 mod timers;
 
 use std::collections::VecDeque;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -44,6 +46,7 @@ use crate::session::Sessions;
 use crate::session::{Decrypted, PendingDecapsulate, PendingEncapsulate};
 use crate::timers::TimerName;
 use crate::{Error, Tunnel};
+use handshake::{Round, RoundEvent};
 use timers::Timers;
 
 /// Packets queued while a handshake is in progress.
@@ -55,8 +58,8 @@ const BATCH: usize = 64;
 /// Something for an [`AsyncTunnel`] to handle.
 pub enum Input {
     /// A message that [`Interface::receive`](crate::Interface::receive) routed to this tunnel,
-    /// with the datagram it came from.
-    Message(ReceivedMessage, Vec<u8>),
+    /// with the datagram it came in and the address it came from.
+    Message(ReceivedMessage, Vec<u8>, SocketAddr),
     /// An IP packet to encrypt and send to the peer.
     Ip(Vec<u8>),
 }
@@ -72,8 +75,8 @@ pub enum Notice {
 
 /// Where an [`AsyncTunnel`] sends its output.
 pub trait Output {
-    /// Sends a datagram to the peer.
-    fn datagram(&self, datagram: Vec<u8>);
+    /// Sends a datagram to the peer at `to`.
+    fn datagram(&self, to: SocketAddr, datagram: Vec<u8>);
     /// Delivers a decrypted packet: the first `len` bytes of `buffer`, including padding.
     fn ip(&self, buffer: Vec<u8>, len: usize);
     fn notice(&self, notice: Notice);
@@ -95,13 +98,13 @@ pub trait Output {
         false
     }
 
-    /// Encrypts a batch of data messages, for example on another thread, and sends them.
-    fn offload_encrypt(&self, batch: Vec<(PendingEncapsulate, Vec<u8>)>) {
+    /// Encrypts a batch of data messages, for example on another thread, and sends them to `to`.
+    fn offload_encrypt(&self, to: SocketAddr, batch: Vec<(PendingEncapsulate, Vec<u8>)>) {
         for (pending, packet) in batch {
             let mut buf = self.buffer(packet.len().next_multiple_of(16) + DATA_OVERHEAD_SZ);
             if let Ok(len) = pending.encrypt(&packet, &mut buf).map(|m| m.len()) {
                 buf.truncate(len);
-                self.datagram(buf);
+                self.datagram(to, buf);
             }
             self.recycle(packet);
         }
@@ -111,14 +114,20 @@ pub trait Output {
     /// to `done` for the tunnel to commit.
     fn offload_decrypt(
         &self,
-        batch: Vec<(PendingDecapsulate, Vec<u8>)>,
+        batch: Vec<(PendingDecapsulate, Vec<u8>, SocketAddr)>,
         done: mpsc::UnboundedSender<Offloaded>,
     ) {
-        for (pending, datagram) in batch {
+        for (pending, datagram, src) in batch {
             let decrypted = pending.decrypt(&datagram, self.buffer(datagram.len()));
             self.recycle(datagram);
-            let _ = done.send(Offloaded::Decrypted(decrypted));
+            let _ = done.send(Offloaded::Decrypted(decrypted, src));
         }
+    }
+
+    /// Returns where to run a round's handshake crypto, which [`AsyncTunnel::run`] then awaits.
+    /// By default it runs in the tunnel's task.
+    fn spawner(&self) -> Option<Spawn> {
+        None
     }
 
     /// Computes a handshake response, for example on another thread, and sends it to `done`
@@ -128,9 +137,13 @@ pub trait Output {
     }
 }
 
+/// Runs a job, for example on another thread.
+pub type Spawn = Arc<dyn Fn(Box<dyn FnOnce() + Send>) + Send + Sync>;
+
 /// Work an [`Output`] finished off the tunnel's task, for the tunnel to commit.
 pub enum Offloaded {
-    Decrypted(Decrypted<Vec<u8>>),
+    /// A decrypted message, with the address it came from.
+    Decrypted(Decrypted<Vec<u8>>, SocketAddr),
     Response(Result<Box<ComputedResponse>, Error>),
 }
 
@@ -141,12 +154,17 @@ pub struct AsyncTunnel {
     rng: ForwardSecureRng,
     config: Config,
     timers: Timers,
-    /// When the current round of handshake attempts began.
-    handshake_started_at: Instant,
+    /// Where the peer is: where it was configured, until it sends an authenticated message from
+    /// elsewhere.
+    endpoint: SocketAddr,
+    /// The round of handshake attempts in progress, if any.
+    round: Option<Round>,
+    /// Where rounds run their crypto, from [`Output::spawner`].
+    spawn: Option<Spawn>,
     pending: VecDeque<Vec<u8>>,
     /// Data messages waiting for [`Output::offload_encrypt`] and [`Output::offload_decrypt`].
     encrypts: Vec<(PendingEncapsulate, Vec<u8>)>,
-    decrypts: Vec<(PendingDecapsulate, Vec<u8>)>,
+    decrypts: Vec<(PendingDecapsulate, Vec<u8>, SocketAddr)>,
     responses: Vec<PendingResponse>,
     established: bool,
     _index_lease: Arc<()>,
@@ -160,8 +178,8 @@ struct Config {
 }
 
 impl Tunnel {
-    /// Converts this tunnel into one that runs its own timers.
-    pub fn into_async(self) -> AsyncTunnel {
+    /// Converts this tunnel into one that runs its own timers, for a peer at `endpoint`.
+    pub fn into_async(self, endpoint: SocketAddr) -> AsyncTunnel {
         let created_at = self.timers[TimerName::TimeLastUpdate];
         let mut tunnel = AsyncTunnel {
             handshake: self.handshake,
@@ -174,7 +192,9 @@ impl Tunnel {
                 rekey_attempt_time: self.timers.rekey_attempt_time_setting(),
             },
             timers: Timers::default(),
-            handshake_started_at: created_at,
+            endpoint,
+            round: None,
+            spawn: None,
             pending: VecDeque::new(),
             encrypts: Vec::new(),
             decrypts: Vec::new(),
@@ -184,7 +204,7 @@ impl Tunnel {
         };
         // Like sanstun's tunnels, one that never completes a handshake still expires.
         tunnel.session_derived(created_at);
-        tunnel.timers.new_handshake_jitter = tunnel.jitter();
+        tunnel.timers.new_handshake_jitter = timers::jitter(&mut tunnel.rng);
 
         tunnel
     }
@@ -206,6 +226,7 @@ impl AsyncTunnel {
         out: impl Output,
     ) -> impl Future<Output = ()> {
         async move {
+            self.spawn = out.spawner();
             let mut inputs = Vec::with_capacity(BATCH);
             let (done, mut offloaded) = mpsc::unbounded_channel();
             let mut commits = Vec::with_capacity(BATCH);
@@ -216,17 +237,22 @@ impl AsyncTunnel {
                 tokio::select! {
                     biased;
 
-                    () = timers.retransmit_handshake.expired() => self.retransmit_handshake(now(), &out),
+                    event = Round::next(&mut self.round) => match event {
+                        RoundEvent::Initiation(initiation) => {
+                            self.send_initiation(initiation, now(), &out);
+                        }
+                        RoundEvent::Finished(session) => self.round_finished(session, now(), &out),
+                    },
                     () = timers.send_keepalive.expired() => self.send_keepalive(now(), &out),
-                    () = timers.new_handshake.expired() => self.new_handshake(now(), &out),
+                    () = timers.new_handshake.expired() => self.new_handshake(),
                     () = timers.persistent_keepalive.expired() => self.send_keepalive(now(), &out),
                     () = timers.zero_key_material.expired() => self.expire(&out),
                     _ = offloaded.recv_many(&mut commits, BATCH) => {
                         let now = now();
                         for done in commits.drain(..) {
                             let result = match done {
-                                Offloaded::Decrypted(decrypted) => {
-                                    self.commit(decrypted, now, &out)
+                                Offloaded::Decrypted(decrypted, src) => {
+                                    self.commit(decrypted, src, now, &out)
                                 }
                                 Offloaded::Response(computed) => computed
                                     .and_then(|computed| self.commit_response(*computed, now, &out)),
@@ -249,7 +275,7 @@ impl AsyncTunnel {
 
                 self.flush(now(), &out);
                 if !self.encrypts.is_empty() {
-                    out.offload_encrypt(std::mem::take(&mut self.encrypts));
+                    out.offload_encrypt(self.endpoint, std::mem::take(&mut self.encrypts));
                 }
                 if !self.decrypts.is_empty() {
                     out.offload_decrypt(std::mem::take(&mut self.decrypts), done.clone());
@@ -267,17 +293,17 @@ impl AsyncTunnel {
                 self.send_ip(packet, now, out);
                 Ok(())
             }
-            Input::Message(ReceivedMessage::HandshakeInitiation(init), _) => {
-                self.handle_handshake_initiation(init, now, out)
+            Input::Message(ReceivedMessage::HandshakeInitiation(init), _, src) => {
+                self.handle_handshake_initiation(init, src, now, out)
             }
-            Input::Message(ReceivedMessage::HandshakeResponse(response), _) => {
-                self.handle_handshake_response(response, now, out)
+            Input::Message(ReceivedMessage::HandshakeResponse(response), ..) => {
+                self.handle_handshake_response(response)
             }
-            Input::Message(ReceivedMessage::CookieReply(reply), _) => {
+            Input::Message(ReceivedMessage::CookieReply(reply), ..) => {
                 self.handle_cookie_reply(reply, now)
             }
-            Input::Message(ReceivedMessage::TransportData(data), datagram) => {
-                self.decapsulate(data, datagram, now, out)
+            Input::Message(ReceivedMessage::TransportData(data), datagram, src) => {
+                self.decapsulate(data, datagram, src, now, out)
             }
         };
         if let Err(e) = result {
@@ -307,7 +333,7 @@ mod tests {
     struct Discard;
 
     impl Output for Discard {
-        fn datagram(&self, _: Vec<u8>) {}
+        fn datagram(&self, _: SocketAddr, _: Vec<u8>) {}
         fn ip(&self, _: Vec<u8>, _: usize) {}
         fn notice(&self, _: Notice) {}
     }
@@ -321,7 +347,7 @@ mod tests {
         let tunnel = a
             .new_tunnel(b.static_public(), TunnelConfig::default(), now)
             .unwrap()
-            .into_async();
+            .into_async("10.0.0.2:51820".parse().unwrap());
         let tunnel_size = size_of_val(&tunnel);
         let (_tx, rx) = mpsc::channel(1);
 

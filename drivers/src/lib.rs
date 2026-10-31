@@ -163,9 +163,10 @@ impl Node {
                 if let Some(interval) = peer.persistent_keepalive {
                     tunnel_config = tunnel_config.with_persistent_keepalive(interval);
                 }
-                let tunnel: Tunnel = interface
+                let mut tunnel: Tunnel = interface
                     .new_tunnel(peer.public_key, tunnel_config, now)
                     .expect("peer keys are valid");
+                tunnel.set_defer_handshake_crypto(config.offload);
 
                 peer::Peer::new(id, peer.addr, tunnel)
             })

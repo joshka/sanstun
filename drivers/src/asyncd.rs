@@ -36,11 +36,10 @@ pub(crate) async fn run(node: Node, io: NodeIo) {
             let (tx, rx) = mpsc::channel(INBOX);
             let out = PeerOutput {
                 id,
-                addr,
                 out: out.clone(),
                 offload,
             };
-            tunnels.spawn(crate::polls::timed(tunnel.into_async().run(rx, out)));
+            tunnels.spawn(crate::polls::timed(tunnel.into_async(addr).run(rx, out)));
             tx
         })
         .collect::<Vec<_>>();
@@ -59,10 +58,10 @@ pub(crate) async fn run(node: Node, io: NodeIo) {
 
             _ = recv_offloaded(&mut offloaded, &mut parsed) => {
                 for done in parsed.drain(..) {
-                    if let Offloaded::Initiation(Ok(init)) = done
+                    if let Offloaded::Initiation(Ok(init), src) = done
                         && let Some((id, message)) = routes.accept(&mut interface, init)
                     {
-                        batches.push(id, Input::Message(message, Vec::new()));
+                        batches.push(id, Input::Message(message, Vec::new(), src));
                     }
                 }
             }
@@ -75,7 +74,7 @@ pub(crate) async fn run(node: Node, io: NodeIo) {
                     if let Some((id, message)) =
                         routes.receive(&mut interface, src, &datagram, now, &mut out)
                     {
-                        batches.push(id, Input::Message(message, datagram));
+                        batches.push(id, Input::Message(message, datagram, src));
                     }
                 }
             }
@@ -99,15 +98,14 @@ pub(crate) async fn run(node: Node, io: NodeIo) {
 /// Addresses one tunnel's output to its peer.
 pub(crate) struct PeerOutput {
     pub(crate) id: PeerId,
-    pub(crate) addr: SocketAddr,
     pub(crate) out: Output,
     /// Encrypts and decrypts on rayon's pool.
     pub(crate) offload: bool,
 }
 
 impl sanstun::aio::Output for PeerOutput {
-    fn datagram(&self, datagram: Vec<u8>) {
-        self.out.datagram(self.addr, datagram);
+    fn datagram(&self, to: SocketAddr, datagram: Vec<u8>) {
+        self.out.datagram(to, datagram);
     }
 
     fn ip(&self, mut buffer: Vec<u8>, len: usize) {
@@ -127,14 +125,19 @@ impl sanstun::aio::Output for PeerOutput {
         self.offload
     }
 
-    fn offload_encrypt(&self, batch: Vec<(PendingEncapsulate, Vec<u8>)>) {
-        let (out, addr) = (self.out.clone(), self.addr);
+    fn spawner(&self) -> Option<aio::Spawn> {
+        self.offload
+            .then(|| std::sync::Arc::new(|job: Box<dyn FnOnce() + Send>| rayon::spawn(job)) as _)
+    }
+
+    fn offload_encrypt(&self, to: SocketAddr, batch: Vec<(PendingEncapsulate, Vec<u8>)>) {
+        let out = self.out.clone();
         rayon::spawn(move || {
             for (pending, packet) in batch {
                 let mut buf = crate::pool::take(packet.len().next_multiple_of(16) + 32);
                 if let Ok(len) = pending.encrypt(&packet, &mut buf).map(|m| m.len()) {
                     buf.truncate(len);
-                    out.datagram(addr, buf);
+                    out.datagram(to, buf);
                 }
                 crate::pool::recycle(packet);
             }
@@ -143,14 +146,14 @@ impl sanstun::aio::Output for PeerOutput {
 
     fn offload_decrypt(
         &self,
-        batch: Vec<(PendingDecapsulate, Vec<u8>)>,
+        batch: Vec<(PendingDecapsulate, Vec<u8>, SocketAddr)>,
         done: mpsc::UnboundedSender<aio::Offloaded>,
     ) {
         rayon::spawn(move || {
-            for (pending, datagram) in batch {
+            for (pending, datagram, src) in batch {
                 let decrypted = pending.decrypt(&datagram, crate::pool::take(datagram.len()));
                 crate::pool::recycle(datagram);
-                let _ = done.send(aio::Offloaded::Decrypted(decrypted));
+                let _ = done.send(aio::Offloaded::Decrypted(decrypted, src));
             }
         });
     }

@@ -50,10 +50,13 @@ pub(crate) async fn run(node: Node, io: NodeIo) {
         tasks.spawn(crate::polls::timed(timer(shared.clone(), out.clone())));
     }
 
+    // The network task commits offloaded work, including the TUN task's.
+    let (mut out, mut offloaded) = out.offloading(offload);
+
     // Stops the node once the TUN device closes.
     let mut tun = tokio::spawn(crate::polls::timed({
         let peers = peers.clone();
-        let (mut out, _) = out.offloading(offload);
+        let mut out = out.offloading_alongside();
         async move {
             let mut packets = Vec::with_capacity(BATCH);
             while tun_rx.recv_many(&mut packets, BATCH).await > 0 {
@@ -69,7 +72,6 @@ pub(crate) async fn run(node: Node, io: NodeIo) {
     }));
     let _tun = AbortOnDrop(tun.abort_handle());
 
-    let (mut out, mut offloaded) = out.offloading(offload);
     let mut datagrams = Vec::with_capacity(BATCH);
     let mut commits = Vec::with_capacity(BATCH);
     loop {
@@ -83,14 +85,14 @@ pub(crate) async fn run(node: Node, io: NodeIo) {
                     let (id, done) = match done.peer() {
                         Some(id) => (id, done),
                         None => {
-                            let Offloaded::Initiation(Ok(init)) = done else { continue };
+                            let Offloaded::Initiation(Ok(init), src) = done else { continue };
                             let Some((id, message)) =
                                 routes.accept(&mut interface.lock().unwrap(), init)
                             else {
                                 continue;
                             };
                             let shared = &peers[id];
-                            shared.peer.lock().unwrap().receive(message, Vec::new(), now, &mut out);
+                            shared.peer.lock().unwrap().receive(message, Vec::new(), src, now, &mut out);
                             shared.deadline_changed.notify_one();
                             continue;
                         }
@@ -114,7 +116,7 @@ pub(crate) async fn run(node: Node, io: NodeIo) {
                             .peer
                             .lock()
                             .unwrap()
-                            .receive(message, datagram, now, &mut out);
+                            .receive(message, datagram, src, now, &mut out);
                         shared.deadline_changed.notify_one();
                     }
                 }

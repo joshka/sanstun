@@ -22,7 +22,20 @@ use sanstun_drivers::scenario::{Running, Star};
 use tokio::runtime::Runtime;
 
 const TUNNELS: [usize; 3] = [1, 16, 256];
-const SIZES: [usize; 2] = [64, 1280];
+/// Packet sizes, where [`IMIX`] stands for a mix of sizes.
+const SIZES: [usize; 3] = [64, 1280, IMIX];
+/// A simple internet mix: 7 small packets, 4 medium and 1 full-sized, at the 1280-byte MTU
+/// Firezone uses.
+const IMIX: usize = 0;
+const IMIX_SIZES: [usize; 12] = [64, 576, 64, 64, 576, 64, 1280, 64, 576, 64, 576, 64];
+
+fn size_name(size: usize) -> String {
+    if size == IMIX {
+        "imix".to_owned()
+    } else {
+        format!("{size}B")
+    }
+}
 /// Packets each spoke sends to the hub, and the hub to each spoke, per iteration.
 const BATCH: usize = 64;
 const WORKER_THREADS: usize = 4;
@@ -102,7 +115,12 @@ async fn receive(node: &mut NodeHandle, count: usize) {
 /// Sends a batch of packets each way between the hub and every spoke, and waits for them all.
 async fn batch(star: &Star, running: &mut Running, size: usize) {
     for spoke in 1..=star.spokes() {
-        for _ in 0..BATCH {
+        for i in 0..BATCH {
+            let size = if size == IMIX {
+                IMIX_SIZES[i % IMIX_SIZES.len()]
+            } else {
+                size
+            };
             send(&running.handles[spoke], 0, size);
             send(&running.handles[0], star.peer(0, spoke), size);
         }
@@ -197,8 +215,9 @@ fn throughput(c: &mut Criterion) {
         for tunnels in TUNNELS {
             for size in SIZES {
                 let mut group = c.benchmark_group(format!(
-                    "throughput/{}/{tunnels}x{size}B",
-                    setup_name(flavor, offload)
+                    "throughput/{}/{tunnels}x{}",
+                    setup_name(flavor, offload),
+                    size_name(size)
                 ));
                 group.throughput(Throughput::Elements((2 * tunnels * BATCH) as u64));
 
@@ -238,7 +257,8 @@ fn throughput(c: &mut Criterion) {
                 } else {
                     "sharded"
                 };
-                let mut group = c.benchmark_group(format!("throughput/{name}/{tunnels}x{size}B"));
+                let mut group =
+                    c.benchmark_group(format!("throughput/{name}/{tunnels}x{}", size_name(size)));
                 group.throughput(Throughput::Elements((2 * tunnels * BATCH) as u64));
 
                 for driver in Driver::ALL {

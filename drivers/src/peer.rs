@@ -9,8 +9,9 @@ use std::net::SocketAddr;
 use std::time::Instant;
 
 use sanstun::{
-    Committed, ComputedResponse, Decrypted, Deferred, Error, Event, HandshakeInitiation, Interface,
-    PendingDecapsulate, PendingEncapsulate, PendingInitiation, PendingResponse, PublicKey,
+    Committed, CompletedHandshake, ComputedOutgoingInitiation, ComputedResponse, Decrypted,
+    Deferred, Error, Event, HandshakeInitiation, Interface, PendingCompletion, PendingDecapsulate,
+    PendingEncapsulate, PendingInitiation, PendingOutgoingInitiation, PendingResponse, PublicKey,
     Received, ReceivedMessage, Tunnel, TunnelId,
 };
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
@@ -120,19 +121,38 @@ pub(crate) struct Output {
 /// A task's batches of crypto work for rayon's pool.
 pub(crate) struct Offload {
     encrypts: Vec<(PendingEncapsulate, Vec<u8>, SocketAddr)>,
-    decrypts: Vec<(PeerId, PendingDecapsulate, Vec<u8>)>,
+    decrypts: Vec<(PeerId, PendingDecapsulate, Vec<u8>, SocketAddr)>,
     responses: Vec<(PeerId, PendingResponse)>,
-    initiations: Vec<PendingInitiation>,
+    initiations: Vec<(PendingInitiation, SocketAddr)>,
+    outgoing: Vec<(PeerId, PendingOutgoingInitiation)>,
+    completions: Vec<(PeerId, PendingCompletion)>,
     /// Returns finished work to the task, which owns the state that commits it.
     done: UnboundedSender<Offloaded>,
 }
 
+impl Offload {
+    fn new(done: UnboundedSender<Offloaded>) -> Self {
+        Offload {
+            encrypts: Vec::new(),
+            decrypts: Vec::new(),
+            responses: Vec::new(),
+            initiations: Vec::new(),
+            outgoing: Vec::new(),
+            completions: Vec::new(),
+            done,
+        }
+    }
+}
+
 /// Work rayon finished, for the task that owns the state to commit.
 pub(crate) enum Offloaded {
-    Decrypted(PeerId, Decrypted<Vec<u8>>),
+    /// A decrypted message, with the address it came from.
+    Decrypted(PeerId, Decrypted<Vec<u8>>, SocketAddr),
     Response(PeerId, Result<Box<ComputedResponse>, Error>),
+    Outgoing(PeerId, Box<ComputedOutgoingInitiation>),
+    Completed(PeerId, Result<Box<CompletedHandshake>, Error>),
     /// A parsed initiation, for the task that owns the interface to accept and route.
-    Initiation(Result<HandshakeInitiation, Error>),
+    Initiation(Result<HandshakeInitiation, Error>, SocketAddr),
 }
 
 impl Offloaded {
@@ -140,8 +160,11 @@ impl Offloaded {
     /// interface accepts first.
     pub(crate) fn peer(&self) -> Option<PeerId> {
         match self {
-            Offloaded::Decrypted(peer, _) | Offloaded::Response(peer, _) => Some(*peer),
-            Offloaded::Initiation(_) => None,
+            Offloaded::Decrypted(peer, ..)
+            | Offloaded::Response(peer, _)
+            | Offloaded::Outgoing(peer, _)
+            | Offloaded::Completed(peer, _) => Some(*peer),
+            Offloaded::Initiation(..) => None,
         }
     }
 }
@@ -192,15 +215,21 @@ impl Output {
         }
 
         let (done, rx) = tokio::sync::mpsc::unbounded_channel();
-        out.offload = Some(Offload {
-            encrypts: Vec::new(),
-            decrypts: Vec::new(),
-            responses: Vec::new(),
-            initiations: Vec::new(),
-            done,
-        });
+        out.offload = Some(Offload::new(done));
 
         (out, Some(rx))
+    }
+
+    /// Returns an output that batches crypto if `self` does, sending finished work to the same
+    /// task as `self`.
+    pub(crate) fn offloading_alongside(&self) -> Output {
+        let mut out = self.clone();
+        out.offload = self
+            .offload
+            .as_ref()
+            .map(|offload| Offload::new(offload.done.clone()));
+
+        out
     }
 
     /// Hands the batched crypto work to rayon. Call after each batch of inputs.
@@ -228,10 +257,10 @@ impl Output {
         if !decrypts.is_empty() {
             let done = offload.done.clone();
             rayon::spawn(move || {
-                for (peer, pending, datagram) in decrypts {
+                for (peer, pending, datagram, src) in decrypts {
                     let result = pending.decrypt(&datagram, pool::take(datagram.len()));
                     pool::recycle(datagram);
-                    let _ = done.send(Offloaded::Decrypted(peer, result));
+                    let _ = done.send(Offloaded::Decrypted(peer, result, src));
                 }
             });
         }
@@ -243,10 +272,22 @@ impl Output {
                 let _ = done.send(Offloaded::Response(peer, pending.compute().map(Box::new)));
             });
         }
-        for pending in std::mem::take(&mut offload.initiations) {
+        for (peer, pending) in std::mem::take(&mut offload.outgoing) {
             let done = offload.done.clone();
             rayon::spawn(move || {
-                let _ = done.send(Offloaded::Initiation(pending.parse()));
+                let _ = done.send(Offloaded::Outgoing(peer, Box::new(pending.compute())));
+            });
+        }
+        for (peer, pending) in std::mem::take(&mut offload.completions) {
+            let done = offload.done.clone();
+            rayon::spawn(move || {
+                let _ = done.send(Offloaded::Completed(peer, pending.compute().map(Box::new)));
+            });
+        }
+        for (pending, src) in std::mem::take(&mut offload.initiations) {
+            let done = offload.done.clone();
+            rayon::spawn(move || {
+                let _ = done.send(Offloaded::Initiation(pending.parse(), src));
             });
         }
     }
@@ -317,20 +358,21 @@ impl Peer {
         self.drain_events(now, out);
     }
 
-    /// Handles a message that [`Interface::receive`] routed to this peer, recycling its
-    /// datagram.
+    /// Handles a message that [`Interface::receive`] routed to this peer from `src`, recycling
+    /// its datagram.
     pub(crate) fn receive(
         &mut self,
         message: ReceivedMessage,
         datagram: Vec<u8>,
+        src: SocketAddr,
         now: Instant,
         out: &mut Output,
     ) {
         let result = match message {
-            ReceivedMessage::TransportData(data) => self.decrypt(data, datagram, now, out),
+            ReceivedMessage::TransportData(data) => self.decrypt(data, datagram, src, now, out),
             message => {
                 pool::recycle(datagram);
-                self.handle_handshake_message(message, now, out)
+                self.handle_handshake_message(message, src, now, out)
             }
         };
         if let Err(e) = result {
@@ -343,20 +385,31 @@ impl Peer {
     fn handle_handshake_message(
         &mut self,
         message: ReceivedMessage,
+        src: SocketAddr,
         now: Instant,
         out: &mut Output,
     ) -> Result<(), Error> {
         match message {
+            // The interface authenticated the initiation, so the peer is at `src`.
             ReceivedMessage::HandshakeInitiation(init) if out.offload.is_some() => {
                 let pending = self.tunnel.begin_handshake_response(init, now)?;
+                self.addr = src;
                 let offload = out.offload.as_mut().unwrap();
                 offload.responses.push((self.id, pending));
                 Ok(())
             }
-            ReceivedMessage::HandshakeInitiation(init) => self
-                .tunnel
-                .handle_handshake_initiation(init, now)
-                .map(|response| out.datagram(self.addr, response.to_vec())),
+            ReceivedMessage::HandshakeInitiation(init) => {
+                let response = self.tunnel.handle_handshake_initiation(init, now)?;
+                self.addr = src;
+                out.datagram(self.addr, response.to_vec());
+                Ok(())
+            }
+            ReceivedMessage::HandshakeResponse(response) if out.offload.is_some() => {
+                let pending = self.tunnel.begin_handshake_completion(response, now)?;
+                let offload = out.offload.as_mut().unwrap();
+                offload.completions.push((self.id, pending));
+                Ok(())
+            }
             ReceivedMessage::HandshakeResponse(response) => self
                 .tunnel
                 .handle_handshake_response(response, now)
@@ -377,6 +430,7 @@ impl Peer {
         &mut self,
         data: sanstun::TransportData,
         datagram: Vec<u8>,
+        src: SocketAddr,
         now: Instant,
         out: &mut Output,
     ) -> Result<(), Error> {
@@ -388,23 +442,34 @@ impl Peer {
             }
         };
         if let Some(offload) = &mut out.offload {
-            offload.decrypts.push((self.id, pending, datagram));
+            offload.decrypts.push((self.id, pending, datagram, src));
             return Ok(());
         }
 
         let decrypted = pending.decrypt(&datagram, pool::take(datagram.len()));
         pool::recycle(datagram);
-        self.commit_decrypted(decrypted, now, out)
+        self.commit_decrypted(decrypted, src, now, out)
     }
 
     /// Commits work that rayon finished for this peer.
     pub(crate) fn commit(&mut self, offloaded: Offloaded, now: Instant, out: &mut Output) {
         let result = match offloaded {
-            Offloaded::Decrypted(_, decrypted) => self.commit_decrypted(decrypted, now, out),
+            Offloaded::Decrypted(_, decrypted, src) => {
+                self.commit_decrypted(decrypted, src, now, out)
+            }
             Offloaded::Response(_, computed) => computed
                 .and_then(|computed| self.tunnel.commit_handshake_response(*computed, now))
                 .map(|response| out.datagram(self.addr, response.to_vec())),
-            Offloaded::Initiation(_) => unreachable!("initiations go to the interface"),
+            Offloaded::Outgoing(_, computed) => {
+                if let Some(init) = self.tunnel.commit_handshake_initiation(*computed) {
+                    out.datagram(self.addr, init.to_vec());
+                }
+                Ok(())
+            }
+            Offloaded::Completed(_, completed) => completed
+                .and_then(|completed| self.tunnel.commit_handshake_completion(*completed, now))
+                .map(|keepalive| out.datagram(self.addr, keepalive.to_vec())),
+            Offloaded::Initiation(..) => unreachable!("initiations go to the interface"),
         };
         if let Err(e) = result {
             out.error(self.id, e);
@@ -413,13 +478,17 @@ impl Peer {
         self.drain_events(now, out);
     }
 
+    /// Accepts a decrypted message from `src`. Once it is authenticated, the peer is at `src`.
     fn commit_decrypted(
         &mut self,
         decrypted: Decrypted<Vec<u8>>,
+        src: SocketAddr,
         now: Instant,
         out: &mut Output,
     ) -> Result<(), Error> {
-        match self.tunnel.commit_decapsulate(decrypted, now)? {
+        let committed = self.tunnel.commit_decapsulate(decrypted, now)?;
+        self.addr = src;
+        match committed {
             Committed::Data { mut buffer, len } => {
                 buffer.truncate(ip_packet_len(&buffer[..len]));
                 out.ip(self.id, buffer);
@@ -480,6 +549,16 @@ impl Peer {
                 Event::SendHandshakeInitiation(datagram) | Event::SendKeepalive(datagram) => {
                     out.datagram(self.addr, datagram.to_vec());
                 }
+                Event::ComputeHandshakeInitiation(pending) => match &mut out.offload {
+                    Some(offload) => offload.outgoing.push((self.id, pending)),
+                    None => {
+                        if let Some(init) =
+                            self.tunnel.commit_handshake_initiation(pending.compute())
+                        {
+                            out.datagram(self.addr, init.to_vec());
+                        }
+                    }
+                },
                 Event::Established { .. } => out.event(self.id, NodeEvent::Established),
                 Event::ConnectionExpired => {
                     self.pending.clear();
@@ -533,7 +612,7 @@ impl Routes {
             Some(offload) => match interface.receive_deferring_handshakes(src, datagram, now) {
                 Ok(Deferred::Received(received)) => Ok(received),
                 Ok(Deferred::Initiation(pending)) => {
-                    offload.initiations.push(pending);
+                    offload.initiations.push((pending, src));
                     return None;
                 }
                 Err(e) => Err(e),

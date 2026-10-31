@@ -418,6 +418,89 @@ fn lost_link_retries_handshakes_then_expires() {
     }
 }
 
+/// With a round trip longer than `REKEY_TIMEOUT`, each response arrives after the next retry,
+/// so the handshake only completes if a response to the attempt before the latest still counts.
+#[test]
+fn late_responses_complete_the_handshake() {
+    let star = Star::new(1, 1);
+    let latency = secs(3);
+
+    for driver in Driver::ALL {
+        eprintln!("checking {}", driver.name());
+        let t = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .unwrap()
+            .block_on(scenario::run(
+                driver,
+                &star,
+                latency,
+                &[send(1, 0, "slow"), Step::Wait(secs(10))],
+            ));
+
+        let inits = sent(&t, star.addr(1), Kind::Init);
+        assert_eq!(inits[0], secs(0));
+        assert!(
+            inits[1] > REKEY_TIMEOUT && inits[1] < latency * 2,
+            "{inits:?}"
+        );
+        // sanstun completes with its previous initiation but keeps the latest in flight, so it
+        // retries once more after the handshake completed. A round of async attempts ends when
+        // one completes.
+        let expected = if driver.runs_tunnel() { 3 } else { 2 };
+        assert_eq!(inits.len(), expected, "{inits:?}");
+        // The response to the latest attempt arrives once the round is over, and is rejected.
+        let established = events(&t, star.addr(1))
+            .into_iter()
+            .filter(|(_, e)| !matches!(e, NodeEvent::Error(_)))
+            .collect::<Vec<_>>();
+        assert_eq!(established, [(latency * 2, NodeEvent::Established)]);
+        assert_eq!(decrypted(&t, star.addr(0)), [scenario::ip_packet(b"slow")]);
+    }
+}
+
+/// A NAT rebinds a spoke to another port. The hub learns the new port from the spoke's next
+/// authenticated packet, and replies there.
+#[test]
+fn replies_follow_a_rebound_peer() {
+    let star = Star::new(1, 1);
+    let (hub, spoke) = (star.addr(0), star.addr(1));
+    let rebound = SocketAddr::new(spoke.ip(), 40_000);
+
+    for (driver, t) in assert_equivalent(
+        &star,
+        &[
+            send(1, 0, "before"),
+            Step::Wait(ms(100)),
+            send(0, 1, "reply before"),
+            Step::Wait(ms(100)),
+            Step::Rebind {
+                node: 1,
+                port: rebound.port(),
+            },
+            send(1, 0, "after"),
+            Step::Wait(ms(100)),
+            send(0, 1, "reply after"),
+            Step::Wait(ms(100)),
+        ],
+    ) {
+        eprintln!("checking {}", driver.name());
+
+        assert_eq!(
+            decrypted(&t, spoke),
+            [
+                scenario::ip_packet(b"reply before"),
+                scenario::ip_packet(b"reply after")
+            ]
+        );
+        let to_rebound = t.iter().any(|(_, record)| {
+            matches!(record, Record::Wire { from, to, .. } if *from == hub && *to == rebound)
+        });
+        assert!(to_rebound, "the hub never sent to the new port");
+    }
+}
+
 #[test]
 fn healed_link_recovers() {
     let star = Star::new(1, 5);
@@ -587,6 +670,7 @@ fn number_payloads(steps: &mut [Step]) -> Vec<Sent> {
                     *end = now;
                 }
             }
+            Step::Rebind { .. } => {}
             Step::Send { from, to, payload } => {
                 payload.splice(0..0, (i as u32).to_be_bytes());
                 sends.push(Sent {

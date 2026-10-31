@@ -17,7 +17,7 @@ use crate::{Node, NodeIo};
 const INBOX: usize = 1024;
 
 enum Input {
-    Message(ReceivedMessage, Vec<u8>),
+    Message(ReceivedMessage, Vec<u8>, std::net::SocketAddr),
     Ip(Vec<u8>),
 }
 
@@ -60,10 +60,10 @@ pub(crate) async fn run(node: Node, io: NodeIo) {
 
             _ = recv_offloaded(&mut offloaded, &mut parsed) => {
                 for done in parsed.drain(..) {
-                    if let Offloaded::Initiation(Ok(init)) = done
+                    if let Offloaded::Initiation(Ok(init), src) = done
                         && let Some((id, message)) = routes.accept(&mut interface, init)
                     {
-                        batches.push(id, Input::Message(message, Vec::new()));
+                        batches.push(id, Input::Message(message, Vec::new(), src));
                     }
                 }
             }
@@ -76,7 +76,7 @@ pub(crate) async fn run(node: Node, io: NodeIo) {
                     if let Some((id, message)) =
                         routes.receive(&mut interface, src, &datagram, now, &mut out)
                     {
-                        batches.push(id, Input::Message(message, datagram));
+                        batches.push(id, Input::Message(message, datagram, src));
                     }
                 }
             }
@@ -123,8 +123,8 @@ async fn tunnel(
                 let now = now();
                 for input in inputs.drain(..).flatten() {
                     match input {
-                        Input::Message(message, datagram) => {
-                            peer.receive(message, datagram, now, &mut out);
+                        Input::Message(message, datagram, src) => {
+                            peer.receive(message, datagram, src, now, &mut out);
                         }
                         Input::Ip(packet) => peer.send_ip(packet, now, &mut out),
                     }
