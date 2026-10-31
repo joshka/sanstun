@@ -6,7 +6,7 @@ use sanstun::aio::{Input, Notice};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 
-use crate::peer::{AbortOnDrop, Output, Routes, ip_packet_len, now};
+use crate::peer::{AbortOnDrop, BATCH, Output, Routes, forward, ip_packet_len, now};
 use crate::{Node, NodeEvent, NodeIo, PeerId};
 
 /// Bounds each tunnel's inbox, so a slow tunnel applies backpressure instead of buffering.
@@ -45,28 +45,40 @@ pub(crate) async fn run(node: Node, io: NodeIo) {
     // Stops the node once the TUN device closes.
     let tun_inboxes = inboxes.clone();
     let mut tun = tokio::spawn(async move {
-        while let Some((id, packet)) = tun_rx.recv().await {
-            if tun_inboxes[id].send(Input::Ip(packet)).await.is_err() {
-                return;
+        let mut packets = Vec::with_capacity(BATCH);
+        while tun_rx.recv_many(&mut packets, BATCH).await > 0 {
+            for (id, packet) in packets.drain(..) {
+                if forward(&tun_inboxes[id], Input::Ip(packet)).await.is_err() {
+                    return;
+                }
             }
         }
     });
     let _tun = AbortOnDrop(tun.abort_handle());
 
+    let mut datagrams = Vec::with_capacity(BATCH);
     loop {
         tokio::select! {
             biased;
 
             _ = &mut tun => return,
-            datagram = udp_rx.recv() => {
-                let Some((src, datagram)) = datagram else { return };
-                let Some((id, message)) =
-                    routes.receive(&mut interface, src, &datagram, now(), &out)
-                else {
-                    continue;
-                };
-                if inboxes[id].send(Input::Message(message, datagram)).await.is_err() {
+            received = udp_rx.recv_many(&mut datagrams, BATCH) => {
+                if received == 0 {
                     return;
+                }
+                let now = now();
+                for (src, datagram) in datagrams.drain(..) {
+                    let Some((id, message)) =
+                        routes.receive(&mut interface, src, &datagram, now, &out)
+                    else {
+                        continue;
+                    };
+                    if forward(&inboxes[id], Input::Message(message, datagram))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
                 }
             }
         }
@@ -74,10 +86,10 @@ pub(crate) async fn run(node: Node, io: NodeIo) {
 }
 
 /// Addresses one tunnel's output to its peer.
-struct PeerOutput {
-    id: PeerId,
-    addr: SocketAddr,
-    out: Output,
+pub(crate) struct PeerOutput {
+    pub(crate) id: PeerId,
+    pub(crate) addr: SocketAddr,
+    pub(crate) out: Output,
 }
 
 impl sanstun::aio::Output for PeerOutput {

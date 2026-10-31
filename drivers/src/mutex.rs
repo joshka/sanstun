@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
 use tokio::task::JoinSet;
 
-use crate::peer::{AbortOnDrop, Output, Peer, Routes, now, sleep_until};
+use crate::peer::{AbortOnDrop, BATCH, Output, Peer, Routes, now, sleep_until};
 use crate::{Node, NodeIo};
 
 struct Shared {
@@ -49,33 +49,42 @@ pub(crate) async fn run(node: Node, io: NodeIo) {
         let peers = peers.clone();
         let out = out.clone();
         async move {
-            while let Some((id, packet)) = tun_rx.recv().await {
-                let shared = &peers[id];
-                shared.peer.lock().unwrap().send_ip(packet, now(), &out);
-                shared.deadline_changed.notify_one();
+            let mut packets = Vec::with_capacity(BATCH);
+            while tun_rx.recv_many(&mut packets, BATCH).await > 0 {
+                let now = now();
+                for (id, packet) in packets.drain(..) {
+                    let shared = &peers[id];
+                    shared.peer.lock().unwrap().send_ip(packet, now, &out);
+                    shared.deadline_changed.notify_one();
+                }
             }
         }
     });
     let _tun = AbortOnDrop(tun.abort_handle());
 
+    let mut datagrams = Vec::with_capacity(BATCH);
     loop {
         tokio::select! {
             biased;
 
             _ = &mut tun => return,
-            datagram = udp_rx.recv() => {
-                let Some((src, datagram)) = datagram else { return };
+            received = udp_rx.recv_many(&mut datagrams, BATCH) => {
+                if received == 0 {
+                    return;
+                }
                 let now = now();
-                let routed =
-                    routes.receive(&mut interface.lock().unwrap(), src, &datagram, now, &out);
-                if let Some((id, message)) = routed {
-                    let shared = &peers[id];
-                    shared
-                        .peer
-                        .lock()
-                        .unwrap()
-                        .receive(message, &datagram, now, &out);
-                    shared.deadline_changed.notify_one();
+                for (src, datagram) in datagrams.drain(..) {
+                    let routed =
+                        routes.receive(&mut interface.lock().unwrap(), src, &datagram, now, &out);
+                    if let Some((id, message)) = routed {
+                        let shared = &peers[id];
+                        shared
+                            .peer
+                            .lock()
+                            .unwrap()
+                            .receive(message, &datagram, now, &out);
+                        shared.deadline_changed.notify_one();
+                    }
                 }
             }
         }

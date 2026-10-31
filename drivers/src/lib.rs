@@ -10,10 +10,12 @@
 //!   [`Interface`] and tunnels behind mutexes.
 //! - [`Driver::Async`]: the demultiplexer from [`Driver::Channels`], but each tunnel task is
 //!   [`sanstun::aio::AsyncTunnel`], which replaces [`Tunnel`]'s timer state machine and
-//!   [`peer`]'s queueing with async loops.
+//!   [`peer`]'s queueing with the whitepaper's timers.
+//! - [`Driver::AsyncLocal`]: the same async tunnels, hosted as futures in the router's task.
 //!
 //! The first three drivers share the per-tunnel logic in [`peer`], so they differ only in how
-//! state is shared and how work is scheduled. The async driver reimplements that logic. Given the same seeds and the same schedule of inputs, they
+//! state is shared and how work is scheduled. The async drivers reimplement that logic. Given
+//! the same seeds and the same schedule of inputs, the first three
 //! must produce byte-identical traffic. The tests in `tests/equivalence.rs` check this under
 //! tokio's paused clock.
 //!
@@ -28,6 +30,7 @@ use tokio::task::JoinHandle;
 use zeroize::Zeroizing;
 
 mod asyncd;
+mod asynclocal;
 mod channels;
 mod mutex;
 pub mod net;
@@ -45,15 +48,23 @@ pub enum Driver {
     Channels,
     Mutex,
     Async,
+    AsyncLocal,
 }
 
 impl Driver {
-    pub const ALL: [Driver; 4] = [
+    pub const ALL: [Driver; 5] = [
         Driver::SansIo,
         Driver::Channels,
         Driver::Mutex,
         Driver::Async,
+        Driver::AsyncLocal,
     ];
+
+    /// Returns whether the driver runs sanstun's [`Tunnel`] logic, and so must produce
+    /// byte-identical traffic to [`Driver::SansIo`].
+    pub fn runs_tunnel(self) -> bool {
+        !matches!(self, Driver::Async | Driver::AsyncLocal)
+    }
 
     pub fn name(self) -> &'static str {
         match self {
@@ -61,6 +72,7 @@ impl Driver {
             Driver::Channels => "channels",
             Driver::Mutex => "mutex",
             Driver::Async => "async",
+            Driver::AsyncLocal => "async-local",
         }
     }
 
@@ -73,6 +85,7 @@ impl Driver {
             Driver::Channels => tokio::spawn(channels::run(node, io)),
             Driver::Mutex => tokio::spawn(mutex::run(node, io)),
             Driver::Async => tokio::spawn(asyncd::run(node, io)),
+            Driver::AsyncLocal => tokio::spawn(asynclocal::run(node, io)),
         }
     }
 }

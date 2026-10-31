@@ -15,6 +15,9 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::{NodeEvent, NodeIo, PeerId};
 
+/// Inputs a task takes from a channel at once.
+pub(crate) const BATCH: usize = 64;
+
 /// Packets queued per peer while a handshake is in progress. WireGuard's reference
 /// implementations also queue a small number of packets per peer.
 const MAX_PENDING: usize = 64;
@@ -28,6 +31,23 @@ pub(crate) async fn sleep_until(deadline: Option<Instant>) {
     match deadline {
         Some(deadline) => tokio::time::sleep_until(deadline.into()).await,
         None => std::future::pending().await,
+    }
+}
+
+/// Sends to a tunnel's inbox, waiting only if it is full.
+///
+/// `try_send` skips the future and semaphore that `send` sets up, which is most of the cost of a
+/// channel hop when the receiver keeps up.
+pub(crate) async fn forward<T>(
+    inbox: &tokio::sync::mpsc::Sender<T>,
+    message: T,
+) -> Result<(), tokio::sync::mpsc::error::SendError<T>> {
+    match inbox.try_send(message) {
+        Ok(()) => Ok(()),
+        Err(tokio::sync::mpsc::error::TrySendError::Full(message)) => inbox.send(message).await,
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(message)) => {
+            Err(tokio::sync::mpsc::error::SendError(message))
+        }
     }
 }
 

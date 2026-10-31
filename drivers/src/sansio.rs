@@ -1,10 +1,20 @@
 //! (a) One task owns all state, as sans-IO intends.
+//!
+//! Modelled on Firezone's own event loop: a hand-written poll function that drains every ready
+//! input in batches, keeps one timer for the earliest deadline, and yields after a budget of
+//! iterations so that other tasks get to run.
 
 use std::collections::BTreeSet;
+use std::future::Future as _;
+use std::pin::pin;
+use std::task::Poll;
 use std::time::Instant;
 
-use crate::peer::{Output, Peer, Routes, now, sleep_until};
+use crate::peer::{BATCH, Output, Peer, Routes, now};
 use crate::{Node, NodeIo, PeerId};
+
+/// Iterations before the loop yields to other tasks.
+const BUDGET: usize = 16;
 
 pub(crate) async fn run(node: Node, mut io: NodeIo) {
     let Node {
@@ -14,41 +24,83 @@ pub(crate) async fn run(node: Node, mut io: NodeIo) {
     let out = Output::new(&io);
     let routes = Routes::new(&peers);
     let mut timers = Timers::new(&peers);
+    let mut timer = pin!(tokio::time::sleep_until(tokio::time::Instant::now()));
+    let mut timer_at = None;
+    let mut datagrams = Vec::with_capacity(BATCH);
+    let mut packets = Vec::with_capacity(BATCH);
 
-    loop {
-        tokio::select! {
-            biased;
+    std::future::poll_fn(|cx| {
+        for _ in 0..BUDGET {
+            let mut progress = false;
 
-            () = sleep_until(timers.next()) => {
-                let now = now();
-                while let Some(id) = timers.pop_due(now) {
-                    peers[id].handle_timeout(now, &out);
-                    timers.update(&peers[id]);
+            if let Some(next) = timers.next() {
+                if timer_at != Some(next) {
+                    timer.as_mut().reset(next.into());
+                    timer_at = Some(next);
+                }
+                if timer.as_mut().poll(cx).is_ready() {
+                    let now = now();
+                    while let Some(id) = timers.pop_due(now) {
+                        peers[id].handle_timeout(now, &out);
+                        timers.update(&peers[id]);
+                    }
+                    timer_at = None;
+                    progress = true;
                 }
             }
-            datagram = io.udp_rx.recv() => {
-                let Some((src, datagram)) = datagram else { return };
-                let now = now();
-                if let Some((id, message)) =
-                    routes.receive(&mut interface, src, &datagram, now, &out)
-                {
-                    peers[id].receive(message, &datagram, now, &out);
-                    timers.update(&peers[id]);
+
+            match io.udp_rx.poll_recv_many(cx, &mut datagrams, BATCH) {
+                Poll::Ready(0) => return Poll::Ready(()),
+                Poll::Ready(_) => {
+                    let now = now();
+                    for (src, datagram) in datagrams.drain(..) {
+                        if let Some((id, message)) =
+                            routes.receive(&mut interface, src, &datagram, now, &out)
+                        {
+                            peers[id].receive(message, &datagram, now, &out);
+                            timers.touch(id);
+                        }
+                    }
+                    progress = true;
                 }
+                Poll::Pending => {}
             }
-            packet = io.tun_rx.recv() => {
-                let Some((id, packet)) = packet else { return };
-                peers[id].send_ip(packet, now(), &out);
-                timers.update(&peers[id]);
+
+            match io.tun_rx.poll_recv_many(cx, &mut packets, BATCH) {
+                Poll::Ready(0) => return Poll::Ready(()),
+                Poll::Ready(_) => {
+                    let now = now();
+                    for (id, packet) in packets.drain(..) {
+                        peers[id].send_ip(packet, now, &out);
+                        timers.touch(id);
+                    }
+                    progress = true;
+                }
+                Poll::Pending => {}
+            }
+
+            // Ask touched tunnels for their deadlines once per batch rather than per packet.
+            timers.update_touched(&peers);
+
+            if !progress {
+                return Poll::Pending;
             }
         }
-    }
+
+        // Out of budget with work left: run again after other tasks.
+        cx.waker().wake_by_ref();
+        Poll::Pending
+    })
+    .await
 }
 
 /// Each peer's next deadline, ordered so the earliest is found without scanning every peer.
 struct Timers {
     deadlines: Vec<Option<Instant>>,
     queue: BTreeSet<(Instant, PeerId)>,
+    /// Peers whose deadlines may have changed since the last update.
+    touched: Vec<PeerId>,
+    is_touched: Vec<bool>,
 }
 
 impl Timers {
@@ -56,6 +108,8 @@ impl Timers {
         let mut timers = Timers {
             deadlines: vec![None; peers.len()],
             queue: BTreeSet::new(),
+            touched: Vec::new(),
+            is_touched: vec![false; peers.len()],
         };
         for peer in peers {
             timers.update(peer);
@@ -77,6 +131,21 @@ impl Timers {
         self.deadlines[id] = None;
 
         Some(id)
+    }
+
+    fn touch(&mut self, id: PeerId) {
+        if !std::mem::replace(&mut self.is_touched[id], true) {
+            self.touched.push(id);
+        }
+    }
+
+    fn update_touched(&mut self, peers: &[Peer]) {
+        let mut touched = std::mem::take(&mut self.touched);
+        for id in touched.drain(..) {
+            self.is_touched[id] = false;
+            self.update(&peers[id]);
+        }
+        self.touched = touched;
     }
 
     fn update(&mut self, peer: &Peer) {

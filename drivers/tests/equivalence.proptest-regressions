@@ -1,7 +1,0 @@
-# Seeds for failure cases proptest has generated in the past. It is
-# automatically read and these particular cases re-run before any
-# novel cases are generated.
-#
-# It is recommended to check this file in to source control so that
-# everyone who runs the test benefits from these saved cases.
-cc 4430c47b85c2183c19799f91fdae5dc48bbab44c63bd44bf3d3d71cd45cf0e0e # shrinks to seed = 0, (spokes, steps) = (1, [Send { from: 0, to: 1, payload: [] }, Wait(10.03s), Wait(210s), Wait(10.02s), Send { from: 0, to: 1, payload: [139, 187, 253, 204, 113, 139, 153, 8, 245, 251, 246, 61, 253, 24, 184, 90, 228, 24, 192, 192, 133, 140, 125, 182, 96, 130, 183, 74, 28, 250, 2, 156, 30, 152, 242, 68, 27, 33, 153, 161, 64, 129, 136, 201] }, Wait(170s)])

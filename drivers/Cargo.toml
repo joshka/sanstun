@@ -11,6 +11,7 @@ bench = false
 
 [dependencies]
 sanstun = { path = "..", features = ["tokio"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 tokio = { version = "1.54", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
 zeroize = "1.5.6"
 
