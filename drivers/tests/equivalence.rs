@@ -4,6 +4,10 @@
 //! clock makes time deterministic for the drivers too. Equal transcripts therefore mean equal
 //! ciphertexts, timings, decrypted packets and events, not just similar behaviour.
 //!
+//! The async driver implements the whitepaper's timers itself rather than sanstun's, so its
+//! handshakes and keepalives may happen at other times. It must still deliver exactly the same
+//! packets and report the same establishments and expiries.
+//!
 //! Scripted scenarios also check the reference transcript against the protocol, so that a bug
 //! in the shared per-tunnel logic cannot hide behind every driver agreeing with it.
 
@@ -55,7 +59,7 @@ fn assert_equivalent(star: &Star, steps: &[Step]) -> Vec<(Driver, Transcript)> {
 
     for driver in Driver::ALL {
         let transcript = run(driver, star, steps);
-        if let Some(diff) = first_difference(&reference, &transcript) {
+        if let Some(diff) = divergence(driver, star, &reference, &transcript) {
             panic!(
                 "{} diverges from {}:\n{diff}",
                 driver.name(),
@@ -66,6 +70,88 @@ fn assert_equivalent(star: &Star, steps: &[Step]) -> Vec<(Driver, Transcript)> {
     }
 
     transcripts
+}
+
+/// Compares a driver's transcript with the reference, as closely as the driver promises.
+fn divergence(
+    driver: Driver,
+    star: &Star,
+    reference: &Transcript,
+    transcript: &Transcript,
+) -> Option<String> {
+    if driver.runs_tunnel() {
+        return first_difference(reference, transcript);
+    }
+
+    first_difference(
+        &outcomes(star, reference, &[]),
+        &outcomes(star, transcript, &[]),
+    )
+}
+
+/// Returns the spoke at the other end of a node's tunnel to `peer`.
+fn spoke_of(star: &Star, node: SocketAddr, peer: usize) -> usize {
+    if node == star.addr(0) {
+        peer + 1
+    } else {
+        (1..=star.spokes()).find(|&s| star.addr(s) == node).unwrap()
+    }
+}
+
+/// Returns, for each spoke, when either end of its tunnel to the hub first expired in any of
+/// `transcripts`.
+fn first_expiries<'a>(
+    star: &Star,
+    transcripts: impl IntoIterator<Item = &'a Transcript>,
+) -> Vec<Option<Duration>> {
+    let mut expiries = vec![None; star.spokes() + 1];
+    for (at, record) in transcripts.into_iter().flatten() {
+        if let Record::Event {
+            node,
+            peer,
+            event: NodeEvent::Expired,
+        } = record
+        {
+            let first = &mut expiries[spoke_of(star, *node, *peer)];
+            *first = Some(first.map_or(*at, |first: Duration| first.min(*at)));
+        }
+    }
+
+    expiries
+}
+
+/// Keeps decrypted packets and establishments, without their times. Expiries are left to the
+/// protocol checks.
+///
+/// Drops what happens on a tunnel after `until` for its spoke. Drivers expire idle tunnels under
+/// different policies, and a node that has expired its end drops whatever arrives afterwards.
+fn outcomes(star: &Star, transcript: &Transcript, until: &[Option<Duration>]) -> Transcript {
+    let before_expiry = |at: Duration, node, peer| {
+        until
+            .get(spoke_of(star, node, peer))
+            .copied()
+            .flatten()
+            .is_none_or(|until| at < until)
+    };
+    let mut outcomes = transcript
+        .iter()
+        .filter(|(at, record)| match record {
+            Record::Tun { node, peer, .. } => before_expiry(*at, *node, *peer),
+            Record::Event { node, peer, event } => {
+                *event == NodeEvent::Established && before_expiry(*at, *node, *peer)
+            }
+            Record::Wire { .. } => false,
+        })
+        .map(|(_, record)| (Duration::ZERO, record.clone()))
+        .collect::<Transcript>();
+    outcomes.sort_by_key(|(_, record)| match record {
+        Record::Tun { node, peer, .. } | Record::Event { node, peer, .. } => {
+            (*node, *peer, matches!(record, Record::Event { .. }))
+        }
+        Record::Wire { .. } => unreachable!(),
+    });
+
+    outcomes
 }
 
 fn first_difference(expected: &Transcript, actual: &Transcript) -> Option<String> {
@@ -257,6 +343,29 @@ fn unanswered_data_starts_a_new_handshake() {
     }
 }
 
+/// The whitepaper zeroes key material `REJECT_AFTER_TIME * 3` after the last handshake. sanstun
+/// instead keeps an idle initiator's session fresh, so only the async driver gets there.
+#[test]
+fn idle_keys_are_zeroed_after_three_reject_times() {
+    let star = Star::new(1, 12);
+
+    for (driver, t) in assert_equivalent(&star, &[send(1, 0, "once"), Step::Wait(secs(600))]) {
+        if driver.runs_tunnel() {
+            continue;
+        }
+        let expiries = |node| {
+            events(&t, star.addr(node))
+                .into_iter()
+                .filter(|(_, e)| *e == NodeEvent::Expired)
+                .map(|(at, _)| at)
+                .collect::<Vec<_>>()
+        };
+        // Each side derived its session when the handshake reached it.
+        assert_eq!(expiries(0), [LATENCY + secs(540)]);
+        assert_eq!(expiries(1), [LATENCY * 2 + secs(540)]);
+    }
+}
+
 #[test]
 fn steady_traffic_rekeys_after_two_minutes() {
     let star = Star::new(1, 3);
@@ -337,12 +446,16 @@ fn late_responses_complete_the_handshake() {
             "{inits:?}"
         );
         // sanstun completes with its previous initiation but keeps the latest in flight, so it
-        // retries once more after the handshake completed.
-        assert_eq!(inits.len(), 3, "{inits:?}");
-        assert_eq!(
-            events(&t, star.addr(1)),
-            [(latency * 2, NodeEvent::Established)]
-        );
+        // retries once more after the handshake completed. A round of async attempts ends when
+        // one completes.
+        let expected = if driver.runs_tunnel() { 3 } else { 2 };
+        assert_eq!(inits.len(), expected, "{inits:?}");
+        // The response to the latest attempt arrives once the round is over, and is rejected.
+        let established = events(&t, star.addr(1))
+            .into_iter()
+            .filter(|(_, e)| !matches!(e, NodeEvent::Error(_)))
+            .collect::<Vec<_>>();
+        assert_eq!(established, [(latency * 2, NodeEvent::Established)]);
         assert_eq!(decrypted(&t, star.addr(0)), [scenario::ip_packet(b"slow")]);
     }
 }
@@ -529,13 +642,71 @@ fn separate_link_changes(steps: Vec<Step>) -> Vec<Step> {
     separated
 }
 
-/// Makes every payload unique, so that a transcript shows which send each packet came from.
-fn number_payloads(steps: &mut [Step]) {
+/// Waiting long enough for a queued packet's handshake to be retried and complete.
+const SETTLE: Duration = REKEY_TIMEOUT
+    .saturating_add(MAX_JITTER)
+    .saturating_add(ms(100));
+
+/// A packet a scenario sends.
+struct Sent {
+    at: Duration,
+    spoke: usize,
+    packet: Vec<u8>,
+    /// Whether the link was cut within `SETTLE` of sending it.
+    near_cut: bool,
+}
+
+/// Makes every payload unique and returns what each step sends.
+fn number_payloads(steps: &mut [Step]) -> Vec<Sent> {
+    let mut now = Duration::ZERO;
+    let mut cuts = Vec::<(Duration, Duration)>::new();
+    let mut sends = Vec::new();
     for (i, step) in steps.iter_mut().enumerate() {
-        if let Step::Send { payload, .. } = step {
-            payload.splice(0..0, (i as u32).to_be_bytes());
+        match step {
+            Step::Wait(duration) => now += *duration,
+            Step::Cut => cuts.push((now, Duration::MAX)),
+            Step::Heal => {
+                if let Some((_, end)) = cuts.last_mut().filter(|(_, end)| *end == Duration::MAX) {
+                    *end = now;
+                }
+            }
+            Step::Rebind { .. } => {}
+            Step::Send { from, to, payload } => {
+                payload.splice(0..0, (i as u32).to_be_bytes());
+                sends.push(Sent {
+                    at: now,
+                    spoke: (*from).max(*to),
+                    packet: scenario::ip_packet(payload),
+                    near_cut: false,
+                });
+            }
         }
     }
+    for sent in &mut sends {
+        sent.near_cut = cuts
+            .iter()
+            .any(|&(start, end)| start < sent.at + SETTLE && sent.at < end);
+    }
+
+    sends
+}
+
+/// Returns the packets whose delivery depends on timer policy.
+///
+/// A packet sent while the link is cut is either sent into the void or queued behind a
+/// handshake that completes once the link heals, depending on whether a session existed. A
+/// packet queued shortly before a cut, or before its tunnel expires, waits for a handshake
+/// retry that may come too late. Drivers with different timers may legitimately disagree on
+/// those, so only packets followed by enough uptime and lifetime to retry a handshake must
+/// arrive.
+fn timing_dependent(sends: &[Sent], until: &[Option<Duration>]) -> Vec<Vec<u8>> {
+    sends
+        .iter()
+        .filter(|sent| {
+            sent.near_cut || until[sent.spoke].is_some_and(|until| sent.at + SETTLE > until)
+        })
+        .map(|sent| sent.packet.clone())
+        .collect()
 }
 
 proptest! {
@@ -550,13 +721,27 @@ proptest! {
     ) {
         let star = Star::new(spokes, seed);
         let mut steps = separate_link_changes(steps);
-        number_payloads(&mut steps);
+        let sends = number_payloads(&mut steps);
         steps.push(Step::Wait(secs(200)));
 
         let reference = run(Driver::SansIo, &star, &steps);
         for driver in Driver::ALL {
             let transcript = run(driver, &star, &steps);
-            let diff = first_difference(&reference, &transcript);
+            let diff = if driver.runs_tunnel() {
+                first_difference(&reference, &transcript)
+            } else {
+                let until = first_expiries(&star, [&reference, &transcript]);
+                let skip = timing_dependent(&sends, &until);
+                let compared = |t: &Transcript| -> Transcript {
+                    let t = t
+                        .iter()
+                        .filter(|(_, r)| !matches!(r, Record::Tun { bytes, .. } if skip.contains(bytes)))
+                        .cloned()
+                        .collect();
+                    outcomes(&star, &t, &until)
+                };
+                first_difference(&compared(&reference), &compared(&transcript))
+            };
             if let Some(diff) = diff {
                 prop_assert!(false, "{} diverges from sans-io:\n{diff}", driver.name());
             }

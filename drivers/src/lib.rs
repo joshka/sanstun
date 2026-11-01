@@ -8,9 +8,14 @@
 //!   messages over channels to one task per tunnel.
 //! - [`Driver::Mutex`]: tasks for the network, the TUN device and each tunnel's timers share the
 //!   [`Interface`] and tunnels behind mutexes.
+//! - [`Driver::Async`]: the demultiplexer from [`Driver::Channels`], but each tunnel task is
+//!   [`sanstun::aio::AsyncTunnel`], which replaces [`Tunnel`]'s timer state machine and
+//!   [`peer`]'s queueing with the whitepaper's timers.
+//! - [`Driver::AsyncLocal`]: the same async tunnels, hosted as futures in the router's task.
 //!
-//! The drivers share the per-tunnel logic in [`peer`], so they differ only in how state is
-//! shared and how work is scheduled. Given the same seeds and the same schedule of inputs, they
+//! The first three drivers share the per-tunnel logic in [`peer`], so they differ only in how
+//! state is shared and how work is scheduled. The async drivers reimplement that logic. Given
+//! the same seeds and the same schedule of inputs, the first three
 //! must produce byte-identical traffic. The tests in `tests/equivalence.rs` check this under
 //! tokio's paused clock.
 //!
@@ -24,6 +29,8 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
 use zeroize::Zeroizing;
 
+mod asyncd;
+mod asynclocal;
 mod channels;
 mod mutex;
 pub mod net;
@@ -42,16 +49,32 @@ pub enum Driver {
     SansIo,
     Channels,
     Mutex,
+    Async,
+    AsyncLocal,
 }
 
 impl Driver {
-    pub const ALL: [Driver; 3] = [Driver::SansIo, Driver::Channels, Driver::Mutex];
+    pub const ALL: [Driver; 5] = [
+        Driver::SansIo,
+        Driver::Channels,
+        Driver::Mutex,
+        Driver::Async,
+        Driver::AsyncLocal,
+    ];
+
+    /// Returns whether the driver runs sanstun's [`Tunnel`] logic, and so must produce
+    /// byte-identical traffic to [`Driver::SansIo`].
+    pub fn runs_tunnel(self) -> bool {
+        !matches!(self, Driver::Async | Driver::AsyncLocal)
+    }
 
     pub fn name(self) -> &'static str {
         match self {
             Driver::SansIo => "sans-io",
             Driver::Channels => "channels",
             Driver::Mutex => "mutex",
+            Driver::Async => "async",
+            Driver::AsyncLocal => "async-local",
         }
     }
 
@@ -63,6 +86,8 @@ impl Driver {
             Driver::SansIo => tokio::spawn(polls::timed(sansio::run(node, io))),
             Driver::Channels => tokio::spawn(polls::timed(channels::run(node, io))),
             Driver::Mutex => tokio::spawn(polls::timed(mutex::run(node, io))),
+            Driver::Async => tokio::spawn(polls::timed(asyncd::run(node, io))),
+            Driver::AsyncLocal => tokio::spawn(polls::timed(asynclocal::run(node, io))),
         }
     }
 }

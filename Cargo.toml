@@ -24,8 +24,10 @@ chacha20 = { version = "0.10", default-features = false, features = ["xchacha"] 
 hmac = "0.13"
 subtle = "2.6.1"
 zeroize = "1.5.6"
+tokio = { version = "1.54", optional = true, features = ["sync", "time", "macros"] }
 
 [dev-dependencies]
+tokio = { version = "1.54", features = ["macros", "rt", "time"] }
 rand = "0.10"
 x25519-dalek = { version = "3.0.0", features = ["getrandom"] }
 etherparse = "0.21"

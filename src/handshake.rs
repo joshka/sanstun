@@ -631,6 +631,25 @@ pub(crate) struct Initiator {
 }
 
 impl Initiator {
+    /// Formats an initiation without its MACs, which [`Handshake::append_mac1_and_mac2`] adds.
+    pub(crate) fn initiate(
+        &self,
+        local_index: Index,
+        rng: &mut impl CryptoRng,
+        now: Instant,
+    ) -> ([u8; HANDSHAKE_INIT_SZ], HandshakeInitSentState) {
+        // initiator.ephemeral_private = DH_GENERATE()
+        let ephemeral_private = x25519_dalek::ReusableSecret::random_from_rng(rng);
+
+        format_handshake_initiation(
+            &self.params,
+            &self.stamper,
+            local_index,
+            ephemeral_private,
+            now,
+        )
+    }
+
     pub(crate) fn complete(
         &self,
         sent: &HandshakeInitSentState,

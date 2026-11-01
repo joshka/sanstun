@@ -90,6 +90,14 @@ impl<T> Batches<T> {
 
         Ok(())
     }
+
+    /// Forwards every collected batch, dropping those whose inbox is full, as a full socket
+    /// buffer would.
+    pub(crate) fn try_forward(&mut self, inboxes: &[tokio::sync::mpsc::Sender<Vec<T>>]) {
+        for id in self.touched.drain(..) {
+            let _ = inboxes[id].try_send(std::mem::take(&mut self.batches[id]));
+        }
+    }
 }
 
 /// Aborts a task when dropped.
@@ -321,6 +329,10 @@ impl Peer {
 
     pub(crate) fn id(&self) -> PeerId {
         self.id
+    }
+
+    pub(crate) fn into_parts(self) -> (PeerId, SocketAddr, Tunnel) {
+        (self.id, self.addr, self.tunnel)
     }
 
     pub(crate) fn tunnel_id(&self) -> TunnelId {
