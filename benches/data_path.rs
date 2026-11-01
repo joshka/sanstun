@@ -107,6 +107,16 @@ fn bench_data_path(c: &mut Criterion) {
             b.iter(|| black_box(receiver.borrow_mut().poll_event()))
         });
 
+        // Event loops ask for the next deadline after every packet.
+        group.bench_function("poll_timeout", |b| {
+            b.iter(|| black_box(receiver.borrow().poll_timeout()))
+        });
+
+        // Timers that are not yet due, as when a loop wakes early.
+        group.bench_function("handle_timeout", |b| {
+            b.iter(|| receiver.borrow_mut().handle_timeout(black_box(now)))
+        });
+
         group.finish();
     }
 }
