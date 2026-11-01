@@ -1,5 +1,8 @@
 use crate::errors::Error;
-use crate::handshake::Handshake;
+use crate::handshake::{
+    CompletedHandshake, ComputedOutgoingInitiation, ComputedResponse, Handshake, PendingCompletion,
+    PendingOutgoingInitiation, PendingResponse,
+};
 use crate::index::{Index, TunnelId};
 use crate::keys::{PresharedKey, PublicKey, StaticSecret};
 use crate::message::{
@@ -26,6 +29,10 @@ pub enum Event {
     SendHandshakeInitiation(Datagram),
     /// Send this keepalive to the peer.
     SendKeepalive(Datagram),
+    /// Compute this initiation, for example on another thread, and pass it to
+    /// [`Tunnel::commit_handshake_initiation`]. Only emitted after
+    /// [`Tunnel::set_defer_handshake_crypto`].
+    ComputeHandshakeInitiation(PendingOutgoingInitiation),
     /// The tunnel confirmed its first session.
     ///
     /// Emitted once per tunnel: for the initiator, when it accepts the handshake response; for
@@ -101,6 +108,8 @@ pub struct Tunnel {
     events: RingBuffer<Event, 16>,
     first_initiation_at: Option<Instant>,
     established: bool,
+    /// Whether initiations are left to the caller to compute.
+    defer_handshake_crypto: bool,
 
     /// Reserves this tunnel's index in its [`Interface`](crate::Interface) while the tunnel is alive.
     _index_lease: Arc<()>,
@@ -154,6 +163,7 @@ impl Tunnel {
             events: RingBuffer::new(),
             first_initiation_at: None,
             established: false,
+            defer_handshake_crypto: false,
             _index_lease: index_lease,
         })
     }
@@ -288,6 +298,20 @@ impl Tunnel {
         p: HandshakeInitiation,
         now: Instant,
     ) -> Result<Datagram, Error> {
+        let computed = self.begin_handshake_response(p, now)?.compute()?;
+
+        self.commit_handshake_response(computed, now)
+    }
+
+    /// Checks a handshake initiation and prepares the response, leaving its DHs to
+    /// [`PendingResponse::compute`], which can run on another thread.
+    ///
+    /// Pass the computed response to [`Tunnel::commit_handshake_response`].
+    pub fn begin_handshake_response(
+        &mut self,
+        p: HandshakeInitiation,
+        now: Instant,
+    ) -> Result<PendingResponse, Error> {
         if p.0.replayed {
             return Err(Error::ReplayedHandshakeInitiation);
         }
@@ -299,9 +323,21 @@ impl Tunnel {
         tracing::debug!(%remote_idx, "Received handshake initiation");
 
         let local_idx = self.sessions.next_index();
-        let (packet, session) =
-            self.handshake
-                .receive_handshake_initialization(&p, local_idx, &mut self.rng, now)?;
+        self.handshake
+            .begin_response(&p, local_idx, &mut self.rng, now)
+    }
+
+    /// Establishes the session of a computed handshake response and returns the response to
+    /// send back on the path the initiation arrived on.
+    pub fn commit_handshake_response(
+        &mut self,
+        computed: ComputedResponse,
+        now: Instant,
+    ) -> Result<Datagram, Error> {
+        self.ensure_not_expired()?;
+
+        let (packet, session) = self.handshake.commit_response(computed);
+        let local_idx = session.receiving_index();
 
         self.sessions.insert(session);
 
@@ -309,7 +345,7 @@ impl Tunnel {
         self.timers.tick(TimerName::TimeLastPacketSent, now);
         self.timers.tick(TimerName::TimeLastHandshakeCompleted, now);
 
-        tracing::debug!(%local_idx, %remote_idx, "Sending handshake response");
+        tracing::debug!(%local_idx, "Sending handshake response");
 
         Ok(Datagram::new(packet))
     }
@@ -322,18 +358,43 @@ impl Tunnel {
         p: HandshakeResponse,
         now: Instant,
     ) -> Result<Datagram, Error> {
+        let completed = self.begin_handshake_completion(p, now)?.compute()?;
+
+        self.commit_handshake_completion(completed, now)
+    }
+
+    /// Matches a handshake response to the initiation it answers, leaving its DHs to
+    /// [`PendingCompletion::compute`], which can run on another thread.
+    ///
+    /// Pass the result to [`Tunnel::commit_handshake_completion`].
+    pub fn begin_handshake_completion(
+        &self,
+        p: HandshakeResponse,
+        now: Instant,
+    ) -> Result<PendingCompletion, Error> {
         self.ensure_not_expired()?;
 
-        let local_idx = Index::from_peer(p.receiver_idx);
-
         tracing::debug!(
-            %local_idx,
+            local_idx = %Index::from_peer(p.receiver_idx),
             remote_idx = %Index::from_peer(p.sender_idx),
             "Received handshake response"
         );
 
-        let session = self.handshake.receive_handshake_response(p, now)?;
+        self.handshake.begin_completion(p, now)
+    }
 
+    /// Establishes the session of a completed handshake.
+    ///
+    /// Returns the keepalive that confirms the session to the responder.
+    pub fn commit_handshake_completion(
+        &mut self,
+        completed: CompletedHandshake,
+        now: Instant,
+    ) -> Result<Datagram, Error> {
+        self.ensure_not_expired()?;
+
+        let session = self.handshake.commit_completion(completed)?;
+        let local_idx = session.receiving_index();
         self.sessions.insert(session);
 
         self.timers.tick(TimerName::TimeLastPacketReceived, now);
@@ -420,9 +481,9 @@ impl Tunnel {
         let starting_new_handshake = !self.handshake.is_in_progress();
 
         let local_idx = self.sessions.next_index();
-        let packet = self
+        let pending = self
             .handshake
-            .initiate_handshake(local_idx, &mut self.rng, now);
+            .begin_initiation(local_idx, &mut self.rng, now);
 
         tracing::debug!(%local_idx, "Sending handshake initiation");
 
@@ -432,7 +493,36 @@ impl Tunnel {
         self.timers.tick(TimerName::TimeLastPacketSent, now);
         self.first_initiation_at.get_or_insert(now);
 
-        Some(Datagram::new(packet))
+        if self.defer_handshake_crypto {
+            self.events
+                .push_back(Event::ComputeHandshakeInitiation(pending));
+            return None;
+        }
+        let initiation = self.handshake.commit_initiation(pending.compute());
+
+        initiation.map(Datagram::new)
+    }
+
+    /// Makes initiations [`Event::ComputeHandshakeInitiation`]s for the caller to compute,
+    /// rather than computing them in [`Tunnel::initiate_handshake`] and
+    /// [`Tunnel::handle_timeout`], which then return or queue nothing to send.
+    pub fn set_defer_handshake_crypto(&mut self, defer: bool) {
+        self.defer_handshake_crypto = defer;
+    }
+
+    /// Returns a computed initiation to send, or `None` if a newer handshake replaced it or the
+    /// tunnel expired.
+    pub fn commit_handshake_initiation(
+        &mut self,
+        computed: ComputedOutgoingInitiation,
+    ) -> Option<Datagram> {
+        if self.is_expired() {
+            return None;
+        }
+
+        self.handshake
+            .commit_initiation(computed)
+            .map(Datagram::new)
     }
 
     /// Drops all sessions and resets the timers to `now`.

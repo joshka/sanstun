@@ -72,6 +72,10 @@ impl Session {
         }
     }
 
+    pub(crate) fn receiving_index(&self) -> Index {
+        self.receiving_index
+    }
+
     pub(crate) fn established_at(&self) -> Instant {
         self.established_at
     }
